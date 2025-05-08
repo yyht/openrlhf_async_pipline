@@ -41,10 +41,10 @@ OpenRLHF is a high-performance RLHF framework built on Ray, DeepSpeed and HF Tra
 
 - ASYNC-PIPLINE [PPO](./examples/scripts/train_long_cot_ray_7b_reinforce_baseline_tune_zero_v1_onpolicy_env_mask_async_async.sh). We have test async-rollout with pipline to incentivize the reasoning ability on math-tasks with multiturn TIR(tool-intergated-reasoning). It has been tested on 7b/32b for reinforce++ and grpo with env-mask to exclude the loss calculation for env-feedback. [Zhihu](https://zhuanlan.zhihu.com/p/1903425641954674326). It achieves better performance on AIME24/25 with fewer training-steps compared to zeor-rl-text-cot.
 - DETAIL:
-    ./trainer/ray/async_vllm_engine_async.py(function **def add_env_pipline_requests**) for async-rollout.
-    In order to unify the multi-turn tool rl, we further add ./openrlhf/async_pipline/process_request.py to handle different env with the **env_func** from label(suppose label is constructed via json.dumps({})). So, you just need to add different env_func as showed in /env/math/math_tir_process_single_request.py(tir) or default generation method showed in ./openrlhf/async_pipline/process_request.py(function: **def default_generate**)
-    The make_experience.py decouples the rollout-generation and make-exp(calculate the advantages/logprob and so on.). You should focus on function **run_async_queue/gather_queue/put_queue** in ./trainer/ppo_utils/experience_maker.py
-    The ppo-trainer.py also modified to support pipline. ./trainer/ppo_trainer.py(See function **fit**).
+    - ./trainer/ray/async_vllm_engine_async.py(function **def add_env_pipline_requests**) for async-rollout.
+    - In order to unify the multi-turn tool rl, we further add ./openrlhf/async_pipline/process_request.py to handle different env with the **env_func** from label(suppose label is constructed via json.dumps({})). So, you just need to add different env_func as showed in /env/math/math_tir_process_single_request.py(tir) or default generation method showed in ./openrlhf/async_pipline/process_request.py(function: **def default_generate**)
+    - The make_experience.py decouples the rollout-generation and make-exp(calculate the advantages/logprob and so on.). You should focus on function **run_async_queue/gather_queue/put_queue** in ./trainer/ppo_utils/experience_maker.py
+    - The ppo-trainer.py also modified to support pipline. ./trainer/ppo_trainer.py(See function **fit**).
 - RUNNING SCRIPT
 ```
 bash 
