@@ -35,6 +35,11 @@ OpenRLHF is a high-performance RLHF framework built on Ray, DeepSpeed and HF Tra
 - **Hybrid Engine**:  OpenRLHF also supports the hybrid engine, allowing all models and vLLM engines to share the GPUs to avoid GPU idling.
 - **PPO Implementation Optimization**: We integrated the implementation tricks for PPO to improve the training stability, referencing [Zhihu](https://zhuanlan.zhihu.com/p/622134699) and [Advanced Tricks for Training Large Language Models with Proximal Policy Optimization](https://hijkzzz.notion.site/rlhf-implementation-tricks?v=158d9a33ecc98132bf9e000c39227361).
 
+## interactions-scaling
+
+![scaling_img](docs/interactions_scaling.png)
+The model is released at [huggingface](https://huggingface.co/htxu91/zero-tir-7b-550step).
+The evaluation script is located at ./evaluation. You should be careful to set your openrlhf-path in ./evaluation/my_evaluation.py
 
 
 ## Features
