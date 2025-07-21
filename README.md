@@ -258,7 +258,7 @@ FILTER_FN_CONFIG = {
 ENV_GENERATE_CONFIG = {
     'math_tir_generate': math_tir_generate,
     'math_tir_async': math_tir_generate_async,
-    your_env_key: xxx, # the key from the data['task']
+    your_env_func: xxx, # the key from the data['label']['env_func']
 }
 ```
 
