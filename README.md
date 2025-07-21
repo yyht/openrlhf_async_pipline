@@ -209,6 +209,60 @@ fi
 sleep 365d
 ```
 
+## ENV-INTERGERATION
+DATA-EXAMPLE:
+```
+data = {
+    "prompt": xxx,
+    "query": xxx,
+    "label": json.dumps({
+        'uuid': uuid_string,
+        'env_func': your_env_key registered in openrlhf/env/env_config.py,
+        other-keys for you reward-function
+    }),
+    "task": your_task_name registered in openrlhf/env/reward_config.py and openrlhf/env/filter_config.py
+}
+```
+
+To use your own-env:
+- mdkdir in env/your_task
+- you should write a reward/filter .py file just like env/synlogic/synlogic_reward.py and env/synlogic/filter_fn_utils.py .
+- register your reward and filter in openrlhf/env/reward_config.py and openrlhf/env/filter_config.py with your_task_name defined in your dataset.
+```
+REWARD_CONFIG = {
+    'math': math_score,
+    'math_tir': math_score_tir,
+    'kk': kk_score,
+    'zebralogic': zebralogic_score,
+    'synlogic': synlogic_score,
+    your_task_name: your_task_reward
+}
+FILTER_FN_CONFIG = {
+    'math_sample_filter_fn': math_sample_filter_fn,
+    'math_exp_filter_fn': math_exp_filter_fn,
+    'math_reward_fail_fn': math_reward_fail_fn,
+    'math_tir_sample_filter_fn': math_tir_sample_filter_fn,
+    'math_tir_exp_filter_fn': math_tir_exp_filter_fn,
+    'math_tir_reward_fail_fn': math_tir_reward_fail_fn,
+    'synlogic_sample_filter_fn': synlogic_sample_filter_fn,
+    'synlogic_exp_filter_fn': synlogic_exp_filter_fn,
+    'synlogic_reward_fail_fn': synlogic_reward_fail_fn,
+    f"{your_task_name}_sample_filter_fn": xxx_sample_filter_fn,
+    f"{your_task_name}_exp_filter_fn": xxx_exp_filter_fn,
+    f"{your_task_name}_reward_fail_fn": xxx_reward_fail_fn
+}
+```
+- If you need multiturn/multitool, you should also write your own generation logic in env/your_task like env/math/math_tir_process_single_request.py
+- Then you should register your rollout function in openrlhf/env/env_config.py with your **env_func** in your data.
+```
+ENV_GENERATE_CONFIG = {
+    'math_tir_generate': math_tir_generate,
+    'math_tir_async': math_tir_generate_async,
+    env_func: xxx, # the key from the data['task']
+}
+```
+
+
 ## Companies and Organizations using OpenRLHF
 
 - Google
