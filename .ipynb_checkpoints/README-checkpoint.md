@@ -218,7 +218,7 @@ data = {
     "label": json.dumps({
         'uuid': uuid_string,
         'env_func': your_env_key registered in openrlhf/env/env_config.py,
-        other-keys for you reward-function
+        other_info for your usage
     }),
     "task": your_task_name registered in openrlhf/env/reward_config.py and openrlhf/env/filter_config.py
 }
@@ -258,7 +258,7 @@ FILTER_FN_CONFIG = {
 ENV_GENERATE_CONFIG = {
     'math_tir_generate': math_tir_generate,
     'math_tir_async': math_tir_generate_async,
-    env_func: xxx, # the key from the data['task']
+    your_env_key: xxx, # the key from the data['task']
 }
 ```
 
