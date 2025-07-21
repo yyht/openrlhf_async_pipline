@@ -6,9 +6,10 @@ from datetime import datetime
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import RewardDataset
+from openrlhf.datasets.utils import blending_datasets
 from openrlhf.models import get_llm_for_sequence_regression
-from openrlhf.trainer import RewardModelTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.trainer.rm_trainer import RewardModelTrainer
+from openrlhf.utils import get_strategy, get_tokenizer
 
 
 def train(args):
@@ -43,48 +44,57 @@ def train(args):
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
 
     # prepare for data and dataset
-    train_data, eval_data = blending_datasets(
+    train_data = blending_datasets(
         args.dataset,
         args.dataset_probs,
         strategy,
         args.seed,
         max_count=args.max_samples,
-        stopping_strategy="all_exhausted",
-        train_split=args.train_split,
-        eval_split=args.eval_split,
+        dataset_split=args.dataset_split,
     )
+
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
-    eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
     train_dataset = RewardDataset(
         train_data,
         tokenizer,
         args.max_len,
         strategy,
         input_template=args.input_template,
-        multiple_of=args.ring_attn_size,
     )
+
+    # prepare dataloader
+    train_dataloader = strategy.setup_dataloader(
+        train_dataset,
+        args.micro_train_batch_size,
+        True,
+        True,
+        train_dataset.collate_fn,
+    )
+
+    if getattr(args, "eval_dataset", None):
+        eval_data = blending_datasets(
+            args.eval_dataset,
+            None,  # No probability sampling for eval datasets
+            strategy,
+            dataset_split=args.eval_split,
+        )
+    else:
+        # Used for calculating mean/std for reward normalization
+        eval_data = train_data.select(range(min(args.max_samples, int(len(train_data) * 0.01))))
+
     eval_dataset = RewardDataset(
         eval_data,
         tokenizer,
         args.max_len,
         strategy,
         input_template=args.input_template,
-        multiple_of=args.ring_attn_size,
-    )
-
-    train_dataloader = strategy.setup_dataloader(
-        train_dataset,
-        args.micro_train_batch_size,
-        True,
-        True,
-        train_dataset.packing_collate_fn if args.packing_samples else train_dataset.collate_fn,
     )
     eval_dataloader = strategy.setup_dataloader(
         eval_dataset,
         args.micro_train_batch_size,
         True,
         False,
-        eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
+        eval_dataset.collate_fn,
     )
 
     # scheduler
@@ -130,6 +140,8 @@ def train(args):
         max_norm=args.max_norm,
         max_epochs=args.max_epochs,
         loss=args.loss,
+        disable_ds_ckpt=args.disable_ds_ckpt,
+        save_hf_ckpt=args.save_hf_ckpt,
     )
 
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
@@ -155,11 +167,21 @@ if __name__ == "__main__":
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
+    parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
+    parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
+    parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
 
     # DeepSpeed
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
+    parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--full_determinism",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")
     parser.add_argument("--bf16", action="store_true", default=False, help="Enable bfloat16")
@@ -170,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
+    parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # Models
     parser.add_argument("--pretrain", type=str, default=None)
@@ -210,8 +233,12 @@ if __name__ == "__main__":
     parser.add_argument("--packing_samples", action="store_true", default=False)
 
     # Custom dataset
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--dataset_probs", type=str, default="1.0", help="sampling probs for datasets")
+    parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
+    parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
+    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="train")
+    parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
     parser.add_argument("--prompt_key", type=str, default=None)
     parser.add_argument("--chosen_key", type=str, default="chosen")
     parser.add_argument("--rejected_key", type=str, default="rejected")
@@ -220,9 +247,6 @@ if __name__ == "__main__":
         "--apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
     )
     parser.add_argument("--tokenizer_chat_template", type=str, default=None)
-    parser.add_argument("--train_split", type=str, default="train", help="train split of the HF dataset")
-    parser.add_argument("--eval_split", type=str, default="test", help="test split of the dataset")
-    parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
     parser.add_argument("--max_len", type=int, default=512)
 
     # wandb parameters

@@ -19,6 +19,7 @@ API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
 
 from openrlhf.env.env_config import ENV_GENERATE_CONFIG
 from openrlhf.async_pipline.show_timer import Timer
+from openrlhf.env.reward_config import REWARD_CONFIG
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -28,7 +29,6 @@ logger.info({
     'INFO': "##TASK_MAX_CONCURRENT##",
     'VALUE': TASK_MAX_CONCURRENT
 })
-
 
 from pydantic import BaseModel
 class GenerateRequest(BaseModel):
@@ -49,10 +49,14 @@ class GenerateRequest(BaseModel):
     model: str = 'default'
     env_func: Optional[str] = 'default'
     output_text: Optional[str] = ''
+    output_token_ids: Optional[list[int]] = []
     iterative_num: Optional[int] = 0
     env_exec_times: Optional[int] = 0
     label: Optional[str] = json.dumps({})
     request_rank: Optional[int] = 0
+    code_snippets: Optional[list[dict]] = []
+    env_iter_num: Optional[int] = 0
+    max_length: Optional[int] = 1024
     
 
     def to_json(self):
@@ -73,10 +77,14 @@ class GenerateRequest(BaseModel):
             "uuids": self.uuids,
             "model": self.model,
             "output_text": self.output_text,
+            "output_token_ids": self.output_token_ids,
             "iterative_num": self.iterative_num,
             "env_exec_times": self.env_exec_times,
             "label": self.label,
-            "request_rank": self.request_rank
+            "request_rank": self.request_rank,
+            "code_snippets": self.code_snippets,
+            "env_iter_num": self.env_iter_num,
+            "max_length": self.max_length
         }
 
 def flatten_responses(responses):
@@ -97,6 +105,7 @@ async def default_generate(url, headers, idx, request, tokenizer, **kwargs):
     prompts = request.prompts
     assert len(request.prompts) == 1
 
+    max_tokens = request.max_tokens
 
     idx, output = await process_single_request(url, headers, idx, request, **kwargs)
     if output is None:
@@ -108,21 +117,27 @@ async def default_generate(url, headers, idx, request, tokenizer, **kwargs):
     output_text = output[0]['outputs'][0]['text']
 
     label = json.loads(request.label)
-    reward_data = {"query": [new_prompt+output_text], 
-                    "prompts": [new_prompt], 
-                    "labels": [request.label], 
-                    "templates": label.get('template', 'ZERO_TIR'),
-                    "stop_reason": [stop_reason], 
-                    "finish_reason": [finish_reason],
-                    "use_model_reward": label.get('use_model_reward', 'yes')}
-    reward_info = await request_api_wrapper(REMOTE_SERVER, reward_data)
+    # reward_data = {"query": [new_prompt+output_text], 
+    #                 "prompts": [new_prompt], 
+    #                 "labels": [request.label], 
+    #                 "templates": label.get('template', 'ZERO_TIR'),
+    #                 "stop_reason": [stop_reason], 
+    #                 "finish_reason": [finish_reason],
+    #                 "use_model_reward": label.get('use_model_reward', 'yes')}
+    # reward_info = await request_api_wrapper(REMOTE_SERVER, reward_data)
+    if kwargs.get('use_reward', True):
+        reward_info = await REWARD_CONFIG[label.get('task', 'math').lower()](request.prompts[0], output_text, label, finish_reason, tokenizer.pad_token,
+                            max_tokens=max_tokens,
+                            stop_tokens=request.stop)
+    else:
+        reward_info = {}
 
     token_ids = list(output[0]['outputs'][0]['token_ids'])
     action_masks = [1] * len(token_ids)
 
     output = GenerateOutput(
             outputs=[Output(
-                token_ids=list(output[0]['outputs'][0]['token_ids']),
+                token_ids=token_ids+[tokenizer.eos_token_id] if tokenizer.eos_token_id not in token_ids else token_ids,
                 action_mask=action_masks+[1] if tokenizer.eos_token_id not in token_ids else action_masks,
                 text=output[0]['outputs'][0]['text'],
                 stop_reason=output[0]['outputs'][0]['stop_reason'],
@@ -170,16 +185,17 @@ async def _async_process(url, start_idx, batch, **kwargs):
         for i, (result, retry) in enumerate(zip(results, retries)):
             if result is None and retry < MAX_RETRIES:
                 idx = start_idx + i
-                task = process_fn(
-                    url=url,
-                    headers=headers,
-                    idx=idx,
-                    request=batch[i],
-                    **kwargs
-                )
-                # task = run_task(i)
-                tasks.append(task)
-                task_indices.append(i)
+                async with Timer("##ASYNC PROCESS-PROCESS-FN-PROCESS##"):
+                    # async with asyncio.Semaphore(TASK_MAX_CONCURRENT):  # 信号量控制并发
+                        task = process_fn(
+                            url=url,
+                            headers=headers,
+                            idx=idx,
+                            request=batch[i],
+                            **kwargs
+                        )
+                        tasks.append(task)
+                        task_indices.append(i)
 
         if not tasks:
             break
@@ -205,7 +221,7 @@ async def _async_process(url, start_idx, batch, **kwargs):
 
     return successful_results, failed_results
 
-async def _async_process_queue(url, start_idx, batch, **kwargs):
+async def _async_process_queue_old(url, start_idx, batch, **kwargs):
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -216,10 +232,15 @@ async def _async_process_queue(url, start_idx, batch, **kwargs):
     if process_fn is None:
         process_fn = default_generate
     
-    concurrency = kwargs.get('concurrency', 32)  # 并发worker数量
+    concurrency = kwargs.get('concurrency', TASK_MAX_CONCURRENT)  # 并发worker数量
     queue = asyncio.Queue(maxsize=1000)  # 防止队列无限增长
     results = {}
     lock = asyncio.Lock()  # 用于结果字典的线程安全访问
+
+    logger.info({
+        'INFO': '##ASYNC PROCESS-INIT-QUEUE##',
+        'VALUE': len(batch)
+    })
 
     # 初始化队列
     for i, request in enumerate(batch):
@@ -241,20 +262,21 @@ async def _async_process_queue(url, start_idx, batch, **kwargs):
 
                 try:
                     async with Timer("##ASYNC PROCESS-PROCESS-FN-PROCESS##"):
-                        async with asyncio.Semaphore(TASK_MAX_CONCURRENT):  # 信号量控制并发
-                                result = await process_fn(
-                                    url=url,
-                                    headers=headers,
-                                    idx=current_idx,
-                                    request=request,
-                                    **kwargs
-                                )
+                        # async with asyncio.Semaphore(TASK_MAX_CONCURRENT):  # 信号量控制并发
+                            result = await process_fn(
+                                url=url,
+                                headers=headers,
+                                idx=current_idx,
+                                request=request,
+                                **kwargs
+                            )
                 except Exception as e:
                     logger.info(f"Unexpected error, please check: {e}\nTask {current_idx} failed, Unexpected error, please check: {e}")
                     result = e
 
                 # 处理结果
-                async with lock:
+                # async with lock:
+                if 1:
                     if isinstance(result, Exception) or result is None:
                         if retries < MAX_RETRIES - 1:
                             new_task = {
@@ -308,6 +330,114 @@ async def _async_process_queue(url, start_idx, batch, **kwargs):
         result = results.get(i)
         if result is not None:
             successful.append((start_idx + i, result))
+        else:
+            failed.append((start_idx + i, None))
+    
+    return successful, failed
+
+async def _async_process_queue(url, start_idx, batch, **kwargs):
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    
+    env_func = kwargs.get('env_func', None)
+    process_fn = ENV_GENERATE_CONFIG.get(env_func, default_generate)
+    concurrency = kwargs.get('concurrency', TASK_MAX_CONCURRENT)
+    queue_timeout = kwargs.get('queue_timeout', 30)  # 延长默认超时
+    
+    queue = asyncio.Queue(maxsize=1000)
+    results = [None] * len(batch)  # 预分配结果数组
+    stop_event = asyncio.Event()
+
+    logger.info(f"##ASYNC PROCESS-INIT-QUEUE## Size: {len(batch)}")
+
+    # 初始化队列
+    async with Timer("##INITIAL_QUEUE_TIME_INNER##"):
+        for i, request in enumerate(batch):
+            await queue.put({
+                "orig_idx": start_idx + i,
+                "request": request,
+                "retries": 0,
+                "queue_idx": i
+            })
+
+    async def worker():
+        while not stop_event.is_set() and not queue.empty():  # 双重检查
+            try:
+                task = await asyncio.wait_for(queue.get(), timeout=0.5)
+                current_idx = task["orig_idx"]
+                request = task["request"]
+                retries = task["retries"]
+                queue_idx = task["queue_idx"]
+
+                try:
+                    async with Timer("##ASYNC PROCESS-PROCESS-FN-INNER##"):
+                        result = await asyncio.wait_for(process_fn(
+                            url=url,
+                            headers=headers,
+                            idx=current_idx,
+                            request=request,
+                            **kwargs
+                        ), 
+                        timeout=360000
+                        )
+                except Exception as e:
+                    logger.debug(f"Task {current_idx} error: {str(e)[:50]}...")
+                    result = e
+
+                # 结果处理
+                if isinstance(result, Exception) or result is None:
+                    if retries < MAX_RETRIES - 1:
+                        await asyncio.sleep(min(30, 0.5 * (2 ** retries)))
+                        await queue.put({
+                            "orig_idx": current_idx,
+                            "request": request,
+                            "retries": retries + 1,
+                            "queue_idx": queue_idx
+                        })
+                        logger.debug(f"Task {current_idx} retry ({retries+1}/{MAX_RETRIES})")
+                    else:
+                        results[queue_idx] = None
+                        logger.error(f"Task {current_idx} failed after {MAX_RETRIES} retries")
+                elif isinstance(result, GenerateRequest):
+                    await queue.put({
+                        "orig_idx": current_idx,
+                        "request": result,
+                        "retries": retries,
+                        "queue_idx": queue_idx
+                    })
+                    logger.debug(f"Task {current_idx} continuation")
+                else:
+                    results[queue_idx] = result
+
+                queue.task_done()
+                
+            except asyncio.TimeoutError:
+                continue  # 静默处理超时
+
+    # 动态worker池
+    workers = []
+    active_workers = max([min([concurrency, len(batch)]), 1])  # 确保至少1个worker
+
+    async with Timer("##CREATE_WORKER_TIME_INNER##"):
+        for _ in range(active_workers):
+            workers.append(asyncio.create_task(worker()))
+        logger.info(f"##SIZE-OF-QUEUE-WORKERS## Size: {len(workers)}")
+    
+    async with Timer("##JOIN_QUEUE_TIME_INNER##"):
+        await queue.join()
+    
+    stop_event.set()
+    for w in workers:
+        w.cancel()
+
+    async with Timer("##GATHER_QUEUE_TIME_INNER##"):
+        await asyncio.gather(*workers, return_exceptions=True)
+
+    # 分类结果
+    successful = []
+    failed = []
+    for i, res in enumerate(results):
+        if res is not None:
+            successful.append((start_idx + i, res))
         else:
             failed.append((start_idx + i, None))
     

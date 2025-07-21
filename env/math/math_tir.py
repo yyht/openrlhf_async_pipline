@@ -47,13 +47,15 @@ code_pattern = re.compile(r"```python.*?```", re.DOTALL)
 RANK = int(os.getenv('RANK', '1000'))
 ENV_ITER_NUM = int(os.getenv('ENV_ITER_NUM', '2'))
 
-COMPILE_SERVER = os.getenv('COMPILE_SERVER', '')
+COMPILE_SERVER_PORT = os.getenv('COMPILE_SERVER_PORT', '')
 DEBUG_FLAG = os.getenv('DEBUG_FLAG', '')
+NGINX_IP_FILE = os.getenv('NGINX_IP_FILE', '')
 
 logger.info({
-    'INFO': 'COMPILE_SERVER',
-    "VALUE": COMPILE_SERVER,
-    'ENV_ITER_NUM': ENV_ITER_NUM
+    'INFO': 'NGINX_IP_FILE',
+    "VALUE": NGINX_IP_FILE,
+    'ENV_ITER_NUM': ENV_ITER_NUM,
+    "COMPILE_SERVER_PORT": COMPILE_SERVER_PORT
 })
 
 from typing import Generic, TypeVar, Union, NamedTuple
@@ -97,6 +99,13 @@ def remote_compile(code4exec, uuid_str, try_max_times=10, score_key='exec_result
         'query': code4exec,
         'uuid_str': uuid_str,
     }
+
+    ip_list = []
+    with open(NGINX_IP_FILE) as frobj:
+        for line in frobj:
+            ip_list.append(line.strip())
+
+    COMPILE_SERVER = f"{ip_list[0]}:{COMPILE_SERVER_PORT}"
 
     # time.sleep(10*random.random())
     # time.sleep(1.0)
@@ -145,6 +154,13 @@ def remote_compile(code4exec, uuid_str, try_max_times=10, score_key='exec_result
 
 
 def math_tir_generate(llm, sampling_params, prompt_token_ids, tokenizer, prompts=None):
+
+    ip_list = []
+    with open(NGINX_IP_FILE) as frobj:
+        for line in frobj:
+            ip_list.append(line.strip())
+
+    COMPILE_SERVER = f"{ip_list[0]}:{COMPILE_SERVER_PORT}"
     
     output_token_ids = [[] for idx in range(len(prompts))]
     action_masks = [[] for idx in range(len(prompts))]
@@ -207,7 +223,7 @@ def math_tir_generate(llm, sampling_params, prompt_token_ids, tokenizer, prompts
             if left_max_tokens > 0:
                 new_sampling_params.max_tokens = left_max_tokens
             else:
-                new_sampling_params.max_tokens = 1024
+                new_sampling_params.max_tokens = 1
             new_sampling_params_list.append(new_sampling_params)
 
         # print(len(new_sampling_params_list), '===', len(new_prompts))
@@ -280,21 +296,15 @@ def math_tir_generate(llm, sampling_params, prompt_token_ids, tokenizer, prompts
                     if code4exec:
 
                         uuid_str = id2uuid[prompt_idx]
-
-                        if not COMPILE_SERVER:
-                            try:
-                                result = run_code(code4exec)
-                            except Exception as e:
-                                result = str(e)
-                        else:
-                            try:
-                                # result = remote_compile(code4exec)
-                                _, result = remote_compile(code4exec, uuid_str, try_max_times=MAX_RETRIES)
-                            except:
-                                result = 'TimeOut Error'
+                        
+                        try:
+                            # result = remote_compile(code4exec)
+                            _, result = remote_compile(code4exec, uuid_str, try_max_times=MAX_RETRIES)
+                        except:
+                            result = 'TimeOut Error'
 
                         # be careful about the output pattern, make stop-token be complete
-                        code_output = f"""\n\n\n```output\n{result}\n```\n\n\n"""
+                        code_output = f"""\n```output\n{result}\n```\n\n\n"""
                         # code_output = f"""\n{result}"""
 
                         if DEBUG_FLAG == 'yes':
@@ -307,7 +317,7 @@ def math_tir_generate(llm, sampling_params, prompt_token_ids, tokenizer, prompts
 
                         code_output_ids = tokenizer(code_output, add_special_tokens=False)['input_ids']
                         if len(code_output_ids) > 512:
-                            code_output = """The output of the code is too long, please check your code."""
+                            code_output = """\n```output\nThe output of the code is too long, please check your code.\n```\n\n\n"""
                             code_output_ids = tokenizer(code_output, add_special_tokens=False)['input_ids']
                         
                         token_ids.extend(code_output_ids)

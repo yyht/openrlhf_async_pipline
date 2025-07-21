@@ -6,9 +6,10 @@ from datetime import datetime
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import RewardDataset
+from openrlhf.datasets.utils import blending_datasets
 from openrlhf.models import Actor
-from openrlhf.trainer import DPOTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.trainer.dpo_trainer import DPOTrainer
+from openrlhf.utils import get_strategy, get_tokenizer
 
 
 def train(args):
@@ -29,6 +30,7 @@ def train(args):
         target_modules=args.target_modules,
         ds_config=strategy.get_ds_train_config(is_actor=True),
         packing_samples=args.packing_samples,
+        use_liger_kernel=args.use_liger_kernel,
     )
 
     # configure tokenizer
@@ -58,18 +60,16 @@ def train(args):
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
 
     # prepare for data and dataset
-    train_data, eval_data = blending_datasets(
+    train_data = blending_datasets(
         args.dataset,
         args.dataset_probs,
         strategy,
         args.seed,
         max_count=args.max_samples,
-        stopping_strategy="all_exhausted",
-        train_split=args.train_split,
-        eval_split=args.eval_split,
+        dataset_split=args.dataset_split,
     )
+
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
-    eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
     train_dataset = RewardDataset(
         train_data,
         tokenizer,
@@ -77,16 +77,6 @@ def train(args):
         strategy,
         input_template=args.input_template,
         is_dpo=True,
-        multiple_of=args.ring_attn_size,
-    )
-    eval_dataset = RewardDataset(
-        eval_data,
-        tokenizer,
-        args.max_len,
-        strategy,
-        input_template=args.input_template,
-        is_dpo=True,
-        multiple_of=args.ring_attn_size,
     )
 
     # prepare dataloader
@@ -95,16 +85,33 @@ def train(args):
         args.micro_train_batch_size,
         True,
         True,
-        train_dataset.packing_collate_fn if args.packing_samples else train_dataset.collate_fn,
+        train_dataset.collate_fn,
     )
 
-    eval_dataloader = strategy.setup_dataloader(
-        eval_dataset,
-        args.micro_train_batch_size,
-        True,
-        False,
-        eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
-    )
+    eval_dataset = None
+    eval_dataloader = None
+    if getattr(args, "eval_dataset", None):
+        eval_data = blending_datasets(
+            args.eval_dataset,
+            None,  # No probability sampling for eval datasets
+            strategy,
+            dataset_split=args.eval_split,
+        )
+        eval_dataset = RewardDataset(
+            eval_data,
+            tokenizer,
+            args.max_len,
+            strategy,
+            input_template=args.input_template,
+            is_dpo=True,
+        )
+        eval_dataloader = strategy.setup_dataloader(
+            eval_dataset,
+            args.micro_train_batch_size,
+            True,
+            False,
+            eval_dataset.collate_fn,
+        )
 
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
@@ -166,6 +173,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_dpo")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
+    parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
 
     # DeepSpeed
     parser.add_argument("--micro_train_batch_size", type=int, default=8, help="batch size per GPU")
@@ -173,7 +181,14 @@ if __name__ == "__main__":
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
+    parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--full_determinism",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")
@@ -184,9 +199,11 @@ if __name__ == "__main__":
     parser.add_argument("--zpg", type=int, default=1, help="ZeRO++ max partition size")
     parser.add_argument("--adam_offload", action="store_true", default=False, help="Offload Adam Optimizer")
     parser.add_argument("--flash_attn", action="store_true", default=False, help="Enable FlashAttention2")
+    parser.add_argument("--use_liger_kernel", action="store_true", default=False, help="Enable Liger Kernel")
     parser.add_argument("--grad_accum_dtype", type=str, default=None, help="Adam grad accum data type")
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
+    parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # DPO
     parser.add_argument("--max_epochs", type=int, default=1)
@@ -224,10 +241,12 @@ if __name__ == "__main__":
     # Custom dataset
     parser.add_argument("--pretrain", type=str, default=None)
     parser.add_argument("--ref_pretrain", type=str, default=None)
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--dataset_probs", type=str, default="1.0", help="sampling probs for datasets")
-    parser.add_argument("--train_split", type=str, default="train", help="train split of the HF dataset")
-    parser.add_argument("--eval_split", type=str, default="test", help="test split of the dataset")
+    parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
+    parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
+    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="test")
+    parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
 
     parser.add_argument("--prompt_key", type=str, default=None)
     parser.add_argument("--chosen_key", type=str, default="chosen")
@@ -236,7 +255,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
     )
-    parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
     parser.add_argument("--max_len", type=int, default=512)
 
     # wandb parameters

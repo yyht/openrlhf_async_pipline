@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import masked_mean, masked_sum
+from .utils import masked_mean
 
 
 class GPTLMLoss(nn.Module):
@@ -53,15 +53,35 @@ class GPTLMLoss(nn.Module):
         return loss
 
 
+class SFTLoss(nn.Module):
+    """
+    SFT Loss
+    """
+
+    def __init__(self, token_level_loss: bool = True):
+        super().__init__()
+        self.token_level_loss = token_level_loss
+
+    def forward(self, per_token_logps: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+        loss = (
+            masked_mean(-per_token_logps, loss_mask, dim=None)
+            if self.token_level_loss
+            else masked_mean(-per_token_logps, loss_mask, dim=-1).mean()
+        )
+
+        return loss
+
+
 class PolicyLoss(nn.Module):
     """
     Policy Loss for PPO
     """
 
-    def __init__(self, clip_eps: float = 0.2, clip_eps_high: float = 0.28) -> None:
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
         super().__init__()
-        self.clip_eps = clip_eps
+        self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
+        self.token_level_loss = token_level_loss
 
     def forward(
         self,
@@ -69,18 +89,148 @@ class PolicyLoss(nn.Module):
         old_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
-        env_mask: Optional[torch.Tensor] = None,
-        length_status: Optional[torch.Tensor] = None,
+        global_response_length: Optional[torch.Tensor] = None,
+        use_adv_shaping: Optional[bool] = False,
+        entropy: Optional[torch.Tensor] = None,
+        entropy_shape_alpha: Optional[float] = 0.1,
+        entropy_shape_kappa: Optional[float] = 2.0,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        ratio = (log_probs - old_log_probs).exp()
+        loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
+        ratio = (log_probs - old_log_probs)
+        ratio = torch.clamp(ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(ratio)
+        clamp_ratio = ratio.clamp(1 - self.clip_eps_low, 1 + self.clip_eps_high)
         surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps_high) * advantages
+        surr2 = clamp_ratio * advantages
         loss = -torch.min(surr1, surr2)
-        if length_status is not None:
-            loss = masked_sum(loss, action_mask, env_mask, dim=-1).sum() / (length_status['response_length']+1e-10)
+        if use_adv_shaping and entropy is not None:
+            # action-entropy
+            with torch.no_grad():
+                action_entropy = entropy.detach()[:, -action_mask.shape[1] :]
+                advantages_ent_terms = torch.min(entropy_shape_alpha * action_entropy, advantages.abs()/entropy_shape_kappa)
+            advantages = advantages + advantages_ent_terms
+
+        if global_response_length is not None:
+            loss = (loss * action_mask * loss_mask).sum(dim=None) / (1e-10+global_response_length)
         else:
-            loss = masked_mean(loss, action_mask, env_mask, dim=-1).mean()
-        return loss
+            loss = (
+                masked_mean(loss, action_mask*loss_mask, dim=None)
+                if self.token_level_loss
+                else masked_mean(loss, action_mask*loss_mask, dim=-1).mean()
+            )
+        with torch.no_grad():
+            clip_ratio = masked_mean((ratio!=clamp_ratio).float(), action_mask*loss_mask, dim=None)
+            high_clip_ratio = masked_mean((advantages > 0).float() * (ratio > (1 + self.clip_eps_high)).float(), action_mask*loss_mask, dim=None)
+            low_clip_ratio = masked_mean((advantages < 0).float() * (ratio < (1 - self.clip_eps_low)).float(), action_mask*loss_mask, dim=None)
+        return loss, {
+            'clip_ratio': clip_ratio,
+            'high_clip_ratio': high_clip_ratio,
+            'low_clip_ratio': low_clip_ratio
+        }
+
+class CISPolicyLoss(nn.Module):
+    """
+    Policy Loss for PPO
+    """
+
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
+        super().__init__()
+        self.clip_eps_low = clip_eps_low
+        self.clip_eps_high = clip_eps_high
+        self.token_level_loss = token_level_loss
+
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        global_response_length: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
+        ratio = (log_probs - old_log_probs)
+        ratio = torch.clamp(ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(ratio).detach()
+        clamp_ratio = ratio.clamp(1 - self.clip_eps_low, 1 + self.clip_eps_high)
+        loss = -clamp_ratio * advantages * log_probs
+        if global_response_length is not None:
+            loss = (loss * action_mask * loss_mask).sum(dim=None) / (1e-10+global_response_length)
+        else:
+            loss = (
+                masked_mean(loss, action_mask*loss_mask, dim=None)
+                if self.token_level_loss
+                else masked_mean(loss, action_mask*loss_mask, dim=-1).mean()
+            )
+        with torch.no_grad():
+            clip_ratio = masked_mean((ratio!=clamp_ratio).float(), action_mask, dim=None)
+        return loss, {
+            'clip_ratio': clip_ratio,
+        }
+
+class DualPolicyLoss(nn.Module):
+    """
+    Policy Loss for PPO
+    """
+
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
+        super().__init__()
+        self.clip_eps_low = clip_eps_low
+        self.clip_eps_high = clip_eps_high
+        self.token_level_loss = token_level_loss
+        self.clip_ratio_c = 3.0
+
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        global_response_length: Optional[torch.Tensor] = None,
+        use_adv_shaping: Optional[bool] = False,
+        entropy: Optional[torch.Tensor] = None,
+        entropy_shape_alpha: Optional[float] = 0.1,
+        entropy_shape_kappa: Optional[float] = 2.0,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
+        ratio = (log_probs - old_log_probs)
+        ratio = torch.clamp(ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(ratio)
+        clamp_ratio = ratio.clamp(1 - self.clip_eps_low, 1 + self.clip_eps_high)
+        surr1 = ratio * advantages
+        surr2 = clamp_ratio * advantages
+        clip_pg_losses1 = -torch.min(surr1, surr2)
+
+        pg_losses3 = -advantages * self.clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        if use_adv_shaping and entropy is not None:
+            # action-entropy
+            with torch.no_grad():
+                action_entropy = entropy.detach()[:, -action_mask.shape[1] :]
+                advantages_ent_terms = torch.min(entropy_shape_alpha * action_entropy, advantages.abs()/entropy_shape_kappa)
+            advantages = advantages + advantages_ent_terms
+
+        if global_response_length is not None:
+            loss = (loss * action_mask * loss_mask).sum(dim=None) / (1e-10+global_response_length)
+        else:
+            loss = (
+                masked_mean(loss, action_mask * loss_mask, dim=None)
+                if self.token_level_loss
+                else masked_mean(loss, action_mask * loss_mask, dim=-1).mean()
+            )
+        with torch.no_grad():
+            clip_ratio = masked_mean((ratio!=clamp_ratio).float(), action_mask * loss_mask, dim=None)
+            high_clip_ratio = masked_mean((advantages > 0).float() * (ratio > (1 + self.clip_eps_high)).float(), action_mask*loss_mask, dim=None)
+            low_clip_ratio = masked_mean((advantages < 0).float() * (ratio < (1 - self.clip_eps_low)).float(), action_mask*loss_mask, dim=None)
+        return loss, {
+            'clip_ratio': clip_ratio,
+            'high_clip_ratio': high_clip_ratio,
+            'low_clip_ratio': low_clip_ratio
+        }
 
 
 class ValueLoss(nn.Module):
@@ -88,10 +238,10 @@ class ValueLoss(nn.Module):
     Value Loss for PPO
     """
 
-    def __init__(self, clip_eps: float = None, clip_eps_high: float = None) -> None:
+    def __init__(self, clip_eps: float = None, token_level_loss: bool = True) -> None:
         super().__init__()
         self.clip_eps = clip_eps
-        self.clip_eps_high = clip_eps_high
+        self.token_level_loss = token_level_loss
 
     def forward(
         self,
@@ -99,22 +249,20 @@ class ValueLoss(nn.Module):
         old_values: torch.Tensor,
         returns: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
-        env_mask: Optional[torch.Tensor] = None,
-        length_status: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.clip_eps is not None:
-            if self.clip_eps_high is None:
-                self.clip_eps_high = self.clip_eps
-            values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps_high)
+            values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps)
             surr1 = (values_clipped - returns) ** 2
             surr2 = (values - returns) ** 2
             loss = torch.max(surr1, surr2)
         else:
             loss = (values - returns) ** 2
-        if length_status is not None:
-            loss = masked_sum(loss, action_mask, env_mask, dim=-1).sum() / (length_status['response_length']+1e-10)
-        else:
-            loss = masked_mean(loss, action_mask, env_mask, dim=-1).mean()
+
+        loss = (
+            masked_mean(loss, action_mask, dim=None)
+            if self.token_level_loss
+            else masked_mean(loss, action_mask, dim=-1).mean()
+        )
         return 0.5 * loss
 
 
@@ -311,7 +459,7 @@ class PRMLoss(nn.Module):
 
     def forward(self, inputs: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor, *, return_acc: bool = False):
         placeholder_mask = inputs == self.placeholder_token_id
-        logits = logits[placeholder_mask]
+        logits = logits[placeholder_mask].squeeze(1)
         labels = labels[placeholder_mask]
 
         if labels.dtype == torch.float:

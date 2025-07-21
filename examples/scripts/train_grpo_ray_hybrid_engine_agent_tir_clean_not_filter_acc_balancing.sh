@@ -1,0 +1,67 @@
+set -x
+ray job submit --address="http://${MASTER_NODE}:8265/" \
+   --runtime-env-json='{"working_dir": "/openrlhf"}' \
+   -- python3 -m openrlhf.cli.train_ppo_ray \
+   --ref_num_nodes 1 \
+   --ref_num_gpus_per_node 8 \
+   --actor_num_nodes 1 \
+   --actor_num_gpus_per_node 8 \
+   --vllm_num_engines 8 \
+   --vllm_tensor_parallel_size 1 \
+   --colocate_actor_ref \
+   --vllm_gpu_memory_utilization 0.9 \
+   --gamma 1.0 \
+   --async_train \
+   --dynamic_filtering \
+   --dynamic_filtering_reward_range 0.0 0.8 \
+   --eps_clip_low_high 0.2 0.28 \
+   --advantage_estimator reinforce_baseline \
+   --pretrain ${PRETRAIN} \
+   --ref_pretrain ${REF_PRETRAIN} \
+   --agent_func_path /openrlhf/examples/python/agent_func.py \
+   --save_path ${SAVE_PATH} \
+   --ckpt_path ${SAVE_PATH} \
+   --save_hf_ckpt \
+   --micro_train_batch_size 2 \
+   --train_batch_size 2048 \
+   --micro_rollout_batch_size 2 \
+   --rollout_batch_size 128 \
+   --repeatness_threshold 0.05 \
+   --n_samples_per_prompt ${N_ROLLOUT} \
+   --max_epochs 1 \
+   --num_episodes 100000000 \
+   --prompt_max_len 1024 \
+   --max_samples 100000000 \
+   --generate_max_len 8192 \
+   --zero_stage 3 \
+   --bf16 \
+   --init_kl_coef ${KL} \
+   --lr_warmup_ratio ${WARMUP} \
+   --actor_learning_rate ${LR} \
+   --critic_learning_rate 9e-6 \
+   --prompt_data ${DATA_PATH} \
+   --input_key query \
+   --label_key label \
+   --normalize_reward \
+   --gradient_checkpointing \
+   --use_global_token_level_loss \
+   --use_replay_buffer_filter \
+   --use_seq_balancing \
+   --vllm_sync_backend nccl \
+   --vllm_enable_sleep \
+   --filter_sample \
+   --use_sample_strategy \
+   --deepspeed_enable_sleep \
+   --adam_offload \
+   --flash_attn \
+   --normalize_reward \
+   --gradient_checkpointing \
+   --packing_samples \
+   --enforce_eager \
+   --load_checkpoint \
+   --save_steps 50 \
+   --use_tensorboard ${TENSORBOARD} \
+   --remote_rm_url ${REMOTE_RM_URL}
+
+# You could also try
+#   --kl_estimator k2 \

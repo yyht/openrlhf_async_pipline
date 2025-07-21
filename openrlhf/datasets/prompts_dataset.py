@@ -1,9 +1,5 @@
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from openrlhf.utils.logging_utils import init_logger
-import json
-
-logger = init_logger(__name__)
 
 
 def preprocess_data(data, input_template=None, input_key="input", label_key=None, apply_chat_template=None) -> str:
@@ -15,8 +11,7 @@ def preprocess_data(data, input_template=None, input_key="input", label_key=None
     else:
         prompt = data[input_key]
         if input_template:
-            # prompt = input_template.format(prompt)
-            prompt = input_template.replace('{query}', prompt)
+            prompt = input_template.format(prompt)
 
     # for Reinforced Fine-tuning
     label = "" if label_key is None else data[label_key]
@@ -55,23 +50,16 @@ class PromptDataset(Dataset):
 
         self.prompts = []
         self.labels = []
+        self.datasources = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
             prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
             self.prompts.append(prompt)
             self.labels.append(label)
-
-        logger.info({
-            'INFO': "##PROMPT_DATASET##",
-            'PROMPTS_SIZE': len(self.prompts),
-            'LABELS_SIZE': len(self.labels)
-        })
-
-        assert len(self.prompts) == len(self.labels)
-        print(self.labels[0], '==labels==')
+            self.datasources.append(data.get("datasource", "default"))
 
     def __len__(self):
         length = len(self.prompts)
         return length
 
     def __getitem__(self, idx):
-        return self.prompts[idx], self.labels[idx]
+        return self.datasources[idx], self.prompts[idx], self.labels[idx]

@@ -52,6 +52,3 @@ def repeatness(s: str):
     cnt = sum(lcp(arr, sa, c))
 
     return cnt * 2 / (n * (n + 1))
-
-async def repeatness_score_fn(response):
-    return repeatness(response)

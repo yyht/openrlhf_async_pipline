@@ -41,6 +41,8 @@ class KDTrainer(ABC):
         batch_size: int = 1,
         max_epochs: int = 2,
         tokenizer=None,
+        save_hf_ckpt: bool = False,
+        disable_ds_ckpt: bool = False,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -56,6 +58,8 @@ class KDTrainer(ABC):
         self.tokenizer = tokenizer
         self.optimizer = optim
         self.args = strategy.args
+        self.disable_ds_ckpt = disable_ds_ckpt
+        self.save_hf_ckpt = save_hf_ckpt
 
         self.loss_fn = GPTLMLoss()
         self.kd_loss = KDLoss()
@@ -124,10 +128,11 @@ class KDTrainer(ABC):
             # train
             self.model.train()
             self.teacher_model.eval()
-            for prompts_id_len, inputs, attention_masks, _ in self.train_dataloader:
+            for inputs, attention_masks, loss_masks in self.train_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
                 output = self.model(inputs, attention_mask=attention_mask, return_output=True)
+                prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 # loss function
                 labels = torch.where(
@@ -193,17 +198,22 @@ class KDTrainer(ABC):
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
         # eval
-        if global_step % args.eval_steps == 0:
+        if global_step % args.eval_steps == 0 and self.eval_dataloader is not None:
             # do eval when len(dataloader) > 0, avoid zero division in eval.
             if len(self.eval_dataloader) > 0:
                 self.evaluate(self.eval_dataloader, global_step)
+
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            self.strategy.save_ckpt(
-                self.model.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
-            )
+            if not self.disable_ds_ckpt:
+                self.strategy.save_ckpt(
+                    self.model.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
+                )
+            if self.save_hf_ckpt:
+                save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
+                self.strategy.save_model(self.model, self.tokenizer, save_path)
 
     def evaluate(self, eval_dataloader, steps=0):
         times = 0

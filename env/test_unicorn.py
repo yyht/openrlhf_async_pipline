@@ -9,12 +9,14 @@ import os, sys, uuid, json
 from openrlhf.async_pipline.process_request import GenerateRequest, process_batch_requests
 import sys, os
 
-sys.path.append(os.getenv('OPENRLHF_PATH', '/cpfs/user/chenhao/debug/OpenRLHF_0304_vllm083'))
+sys.path.append(os.getenv('OPENRLHF_PATH', '/cpfs/user/chenhao/debug/OpenRLHF_0802/'))
 
 from env.env_config import ENV_GENERATE_CONFIG
 
-os.environ['COMPILE_SERVER'] = 'http://10.39.17.106:10003'
-os.environ['REMOTE_RM_URL'] = 'http://10.39.17.106:10007'
+os.environ['COMPILE_SERVER'] = 'http://10.39.2.54:10003'
+os.environ['REMOTE_RM_URL'] = 'http://10.39.2.54:10007'
+os.environ['MATH_VERIFY_SERVER'] = 'http://10.39.2.54:10008'
+os.environ['XVERIFY_MATH_MODEL_SERVER'] = 'http://10.39.2.54:10005'
 os.environ['VLLM_USE_V1'] = '0'
 # os.environ['DEBUG_FLAG'] = 'yes'
 from env.math.math_tir_process_single_request import math_tir_generate_async
@@ -164,18 +166,18 @@ class ServerController:
         # Consume the stream until the request is finished.
         async for request_output in stream:
             final_output = request_output
-            output = [{
-                'outputs':[
-                    {
-                        "text": final_output.outputs[0].text,
-                        "token_ids": final_output.outputs[0].token_ids,
-                        "stop_reason": final_output.outputs[0].stop_reason,
-                        "finish_reason": final_output.outputs[0].finish_reason,
-                    }
-                ],
-                "prompt_token_ids": final_output.prompt_token_ids
-            }]
-            yield output
+        output = [{
+            'outputs':[
+                {
+                    "text": final_output.outputs[0].text,
+                    "token_ids": final_output.outputs[0].token_ids,
+                    "stop_reason": final_output.outputs[0].stop_reason,
+                    "finish_reason": final_output.outputs[0].finish_reason,
+                }
+            ],
+            "prompt_token_ids": final_output.prompt_token_ids
+        }]
+        return output
         # output = [{
         #         'outputs':[
         #             {
@@ -533,7 +535,7 @@ class ServerController:
         await self.server.serve()
 
     async def health(self):
-        return 1
+        return [1,2,3,4,5,6,7,8,9,10]
 
     # async def restart_server(self):
     #     if self.server:
@@ -563,7 +565,8 @@ class ServerController:
                 uuid_str = str(uuid.uuid4())
                 label_dict = {
                     'uuid': uuid_str,
-                    'env_func': env_func
+                    'env_func': env_func,
+                    'gold_ans': '0'
                 }
             request = GenerateRequest(
                 prompts=[prompt],
@@ -694,7 +697,7 @@ from timeout_decorator import timeout
 def health_check(url):
     for _ in range(2):
         status = requests.get(f'http://{url}/health')
-        print(status, '==statue==')
+        print(status.json(), '==statue==')
 
 def async_post(url, prompts):
     request = GenerateRequest(
@@ -702,7 +705,7 @@ def async_post(url, prompts):
                 prompt_token_ids=[0],
                 max_tokens=1024,
                 temperature=0.1,
-                stop=[],
+                stop=['<|endoftext|>'],
                 model='default',
                 uuids=str(uuid.uuid4())
             )
@@ -765,6 +768,9 @@ for _ in range(1):
     tokenizer=tokenizer)
 
     outputs = ray.get(refs)
+    import time
+    # time.sleep(10.0)
+    # ray.cancel(refs)
 
     # import threading
     # import queue

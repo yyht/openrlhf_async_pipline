@@ -1,18 +1,14 @@
 import random
-import itertools, math, os, json
 from abc import ABC
 from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
+from torch import distributed as dist
 
 from .experience_maker import Experience
-
-from openrlhf.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+from openrlhf.utils.seqlen_balancing import get_minimum_num_micro_batch_size, get_seqlen_balanced_partitions
 
 
 @dataclass
@@ -40,10 +36,9 @@ class BufferItem:
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
+    response_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
-
-    # add env-mask
-    env_mask: Optional[torch.BoolTensor] = None
+    loss_mask: Optional[torch.Tensor]
 
 
 def split_experience_batch(experience: Experience) -> List[BufferItem]:
@@ -58,7 +53,8 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "advantages",
         "attention_mask",
         "action_mask",
-        "env_mask"
+        "response_mask",
+        "loss_mask"
     )
     for key in keys:
         value = getattr(experience, key)
@@ -110,15 +106,14 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "advantages",
         "attention_mask",
         "action_mask",
-        "env_mask"
+        "response_mask",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
-        if not packing_samples:
-            batch_data = zero_pad_sequences(vals, "left") if vals[0] is not None else None
-        else:
-            batch_data = vals if vals[0] is not None else None
-        kwargs[key] = batch_data
+        vals = zero_pad_sequences(vals, "left") if vals[0] is not None else None
+        kwargs[key] = vals
+
+    kwargs['loss_mask'] = torch.tensor([getattr(item, 'loss_mask') for item in items])
 
     kwargs["info"] = {}
     for key in items[0].info.keys():
@@ -129,7 +124,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask, env_mask = (
+        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask, resp_mask = (
             item.sequences,
             item.action_log_probs,
             item.base_action_log_probs,
@@ -138,9 +133,10 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
-            item.env_mask
+            item.response_mask,
         )
-        right_pad = (1 - act_mask.long()).sum()
+        # make sure the right padding position is made
+        right_pad = (1 - resp_mask.long()).sum()
         right_pad = None if right_pad == 0 else -right_pad
 
         # left_pad for seq and att_mask
@@ -154,7 +150,7 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
-            item.env_mask,
+            item.response_mask,
         ) = (
             seq[left_pad:right_pad],
             act_log_prob[:right_pad],
@@ -164,9 +160,49 @@ def remove_padding_in_sequences(items):
             adv[:right_pad],
             att_mask[left_pad:right_pad],
             act_mask[:right_pad],
-            env_mask[:right_pad] if item.env_mask is not None else None,
+            resp_mask[:right_pad],
         )
     return items
+
+def balance_experiences(experiences, args, mode='actor'):
+    """
+    Balance experience accross dp
+    Example:
+        sorted lengths: [8,7,6,5,4,3,2,1], effective_num: 2
+        first_half: [[8,7], [6,5]], last_half: [[3,4], [1,2]], interval_items: [[8,7], [1,2], [6,5], [3,4]]
+        interval_merged: [[8,1,6,3], [7,2,5,4]]
+    """
+    # split experience, sort by total_length
+    items_all = experiences
+    items_all.sort(key=lambda x: x.info["total_length"], reverse=True)
+
+    # split experience into chunks
+    if mode == 'actor':
+        effective_num = (
+            args.actor_num_nodes * args.actor_num_gpus_per_node // args.ring_attn_size // args.ds_tensor_parallel_size
+        )
+    elif mode == 'critic':
+        effective_num = (
+            args.critic_num_nodes * args.critic_num_gpus_per_node // args.ring_attn_size // args.ds_tensor_parallel_size
+        )
+    split_items = [items_all[i : i + effective_num] for i in range(0, len(items_all), effective_num)]
+    half = len(split_items) // 2
+    first_half = split_items[:half]
+    last_half = [item[::-1] for item in split_items[half:]]
+
+    # balance distribution by intervaling chunks
+    interval_items = []
+    for i in range(half):
+        interval_items.append(first_half[i])
+        interval_items.append(last_half[-(i + 1)])
+    if len(last_half) > len(first_half):
+        interval_items.append(last_half[0])
+
+    interval_merged = list(zip(*interval_items))
+    balanced_experiences = []
+    for items in interval_merged:
+        balanced_experiences.extend(items)
+    return balanced_experiences
 
 
 class NaiveReplayBuffer(ABC):
@@ -179,7 +215,12 @@ class NaiveReplayBuffer(ABC):
     """
 
     def __init__(
-        self, strategy, sample_batch_size: int, limit: int = 0, cpu_offload: bool = True, packing_samples: bool = False
+        self, 
+        sample_batch_size: int, 
+        limit: int = 0, 
+        cpu_offload: bool = True, 
+        packing_samples: bool = False,
+        dynamic_batch: bool = False,
     ) -> None:
         super().__init__()
         self.sample_batch_size = sample_batch_size
@@ -190,212 +231,17 @@ class NaiveReplayBuffer(ABC):
         self.target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.items: List[BufferItem] = []
 
-        self.strategy = strategy
-        self.gathered = False
-        self.accuracy_lower_bound = float(1.0 / strategy.args.n_samples_per_prompt)
-        self.accuracy_upper_bound = 0.8
-
-        self.left_items: List[BufferItem] = []
-        self.rollout_step = 0
-        self.is_normalized = False
-        self.failed_rollout_step = 0
-
-        logger.info({
-            'INFO': 'REPLAY_BUFFER_CPU_OFFLOAD',
-            'VALUE': self.cpu_offload
-        })
-
-    def all_gather(self, steps=None):
-
-        if self.strategy.is_rank_0():
-            logger.info({
-                "INFO": "FILTER_BEFORE",
-                "ITEMSIZE": len(self.items),
-                "LEFTSIZE": len(self.left_items),
-                'IS_RANK_0': self.strategy.is_rank_0()
-            })
-
-        cutoff = len(self.items) % self.strategy.args.n_samples_per_prompt
-        if self.strategy.args.use_acc_filter:
-            if cutoff == 0:
-                self.filter_acc()
-            if self.strategy.is_rank_0():
-                logger.info({
-                    "INFO": "ACC_FILTER_AFTER",
-                    "ITEMSIZE": len(self.items),
-                    "LEFTSIZE": len(self.left_items),
-                    'IS_RANK_0': self.strategy.is_rank_0()
-                })
-        
-        if self.strategy.args.use_length_filter:
-            self.filter_seq_length()
-            if self.strategy.is_rank_0():
-                logger.info({
-                    "INFO": "LENGTH_FILTER_AFTER",
-                    "ITEMSIZE": len(self.items),
-                    "LEFTSIZE": len(self.left_items),
-                    'IS_RANK_0': self.strategy.is_rank_0()
-                })
-
-        if self.strategy.args.use_eval_filter:
-            failed_items = self.filter_eval_fail()
-            if self.strategy.is_rank_0():
-                logger.info({
-                    "INFO": "EVAL_FAIL_FILTER_AFTER",
-                    "ITEMSIZE": len(self.items),
-                    "LEFTSIZE": len(self.left_items),
-                    'IS_RANK_0': self.strategy.is_rank_0(),
-                    'FAILED_ITEMS': len(failed_items)
-                })
-
-            if failed_items:
-                actor_rank = self.strategy.get_rank()
-                failed_output_path = os.path.join(self.strategy.args.save_path, f'failed_sample_steps_{steps}_rank_{actor_rank}.jsonl')
-                if os.path.exists(failed_output_path):
-                    failed_output_path = os.path.join(self.strategy.args.save_path, f'failed_sample_steps_{steps}_{self.failed_rollout_step}_rank_{actor_rank}.jsonl')
-                    self.failed_rollout_step += 1
-                with open(failed_output_path, 'w') as fwobj:
-                    for item in failed_items:
-                        tmp = {
-                            'info': {}
-                        }
-                        for key in item.info:
-                            if isinstance(item.info[key], torch.Tensor):
-                                tmp['info'][key] = item.info[key].numpy().item()
-                            else:
-                                tmp['info'][key] = item.info[key]
-                        tmp['sequences'] = item.sequences.numpy().tolist()
-                        tmp['action_log_probs'] = item.action_log_probs.numpy().tolist()
-                        fwobj.write(json.dumps(tmp, ensure_ascii=False)+'\n')
-
-        if self.strategy.args.reuse_offline:
-            if self.strategy.is_rank_0():
-                self.items.extend(self.left_items)
-                self.left_items.clear()
-            if self.strategy.is_rank_0():
-                logger.info({
-                    "INFO": "REUSE_OFFLINE",
-                    "ITEMSIZE": len(self.items),
-                    "LEFTSIZE": len(self.left_items),
-                    'IS_RANK_0': self.strategy.is_rank_0()
-                })
-
-        chunk_size = math.ceil(len(self.items) / self.strategy.args.n_samples_per_prompt)
-        gathered_data = []
-        gathered_failed_data = []
-
-        for i in range(self.strategy.args.n_samples_per_prompt):
-            chunk = self.items[i * chunk_size : (i + 1) * chunk_size]
-            all_chunks: list[list[BufferItem]] = [None] * dist.get_world_size()
-            dist.all_gather_object(all_chunks, chunk)
-            chunk_data = [
-                item.to_device(self.target_device) if not self.cpu_offload else item
-                for item in itertools.chain.from_iterable(all_chunks)
-            ]
-            gathered_data.extend(chunk_data)
-        
-        self.items = gathered_data
-
-        self.gathered = True
-
-        if self.strategy.is_rank_0():
-            logger.info({
-                    "INFO": "ALLGATHERBEFORE",
-                    "ITEMSIZE": len(self.items),
-                    "LEFTSIZE": len(self.left_items) 
-                })
-            if self.strategy.args.dump_data:
-                output_path = os.path.join(self.strategy.args.save_path, f'rollout_sample_steps_{steps}.jsonl')
-                if os.path.exists(output_path):
-                    output_path = os.path.join(self.strategy.args.save_path, f'rollout_sample_steps_{steps}_{self.rollout_step}.jsonl')
-                    self.rollout_step += 1
-                with open(output_path, 'w') as fwobj:
-                    for item in self.items:
-                        tmp = {
-                            'info': {}
-                        }
-                        for key in item.info:
-                            if isinstance(item.info[key], torch.Tensor):
-                                tmp['info'][key] = item.info[key].numpy().item()
-                            else:
-                                tmp['info'][key] = item.info[key]
-                        tmp['sequences'] = item.sequences.numpy().tolist()
-                        tmp['action_log_probs'] = item.action_log_probs.numpy().tolist()
-                        fwobj.write(json.dumps(tmp, ensure_ascii=False)+'\n')
-
-        cutoff = len(self.items) % self.strategy.args.train_batch_size
-        if cutoff != 0:
-            cutoff_items = self.items[:-cutoff]
-            if len(cutoff_items) > 0:
-                if self.strategy.args.reuse_offline:
-                    self.left_items.extend(self.items[-cutoff:])
-                self.items = cutoff_items
-            else:
-                self.left_items.extend(self.items)
-
-            logger.info({
-                "INFO": "ALLGATHER",
-                "CUTOFF": cutoff,
-                "ITEMSIZE": len(self.items),
-                "LEFTITEMSIZE": len(self.left_items)
-            })
-
-    @torch.no_grad()
-    def filter_acc(self):
-        rewards = torch.stack([torch.tensor(item.info['answer_rewards']) for item in self.items])
-        reward_matrix = (rewards==1.0).reshape(-1, self.strategy.args.n_samples_per_prompt).float()
-        acc_tensor = torch.mean(reward_matrix, dim=-1)
-        acc_mask = (acc_tensor >= self.accuracy_lower_bound) & (
-	                acc_tensor <= self.accuracy_upper_bound)
-        batch_acc_mask = acc_mask.repeat_interleave(self.strategy.args.n_samples_per_prompt)
-        batch_acc_tensor = acc_tensor.repeat_interleave(self.strategy.args.n_samples_per_prompt)
-        valid_items = []
-        for acc_mask, acc_tesnor, item in zip(batch_acc_mask, batch_acc_tensor, self.items):
-            if self.strategy.args.sft_loss_coef > 0:
-                acc_ratio = acc_tesnor.item()
-                if acc_ratio <= 2 * self.accuracy_lower_bound and item.info['answer_rewards'] == 1.0:
-                    item.info['acc_ratio'] = 1.0
-                else:
-                    item.info['acc_ratio'] = 0.0
-            if acc_mask:
-                valid_items.append(item)
-        self.items = valid_items
-
-    @torch.no_grad()
-    def filter_eval_fail(self):
-        rule_fail_mask = torch.tensor([item.info['rule_eval_fails'] for item in self.items])
-        model_fail_mask = torch.tensor([item.info['model_eval_fails'] for item in self.items])
-        repeatness_mask = torch.tensor([item.info['repeatness'] for item in self.items])
-        valid_items = []
-        failed_items = []
-        for rule_fail, model_fail, repeatness, item in zip(rule_fail_mask, model_fail_mask, repeatness_mask, self.items):
-            if rule_fail > 0 or model_fail > 0:
-                failed_items.append(item)
-                continue
-            if repeatness > 0.05: # need to check repeatness on r1-sft-dataset
-                continue
-            valid_items.append(item)
-        self.items = valid_items
-        return failed_items
-
-    @torch.no_grad()
-    def filter_seq_length(self):
-        max_output_len = self.strategy.args.generate_max_len
-        filtered_index = []
-        for idx, item in enumerate(self.items):
-            if item.info['response_length'] > max_output_len:
-                continue
-            filtered_index.append(idx)
-        self.items = [self.items[idx] for idx in filtered_index]
+        self.dynamic_batch = dynamic_batch
+        self.dynamic_indices: List[List[int]] = []
+        self.dynamic_loss_scale: List[float] = []
+        self.dynamic_optimizer_step: List[int] = []
 
     @torch.no_grad()
     def append(self, experience: Experience) -> None:
         if self.cpu_offload:
             experience.to_device(torch.device("cpu"))
         items = split_experience_batch(experience)
-        # the packed samples comes with no padding
-        if not self.packing_samples:
-            items = remove_padding_in_sequences(items)
+        items = remove_padding_in_sequences(items)
         self.items.extend(items)
         if self.limit > 0:
             samples_to_remove = len(self.items) - self.limit
@@ -403,18 +249,7 @@ class NaiveReplayBuffer(ABC):
                 self.items = self.items[samples_to_remove:]
 
     def clear(self) -> None:
-        self.gathered = False
-        self.is_normalized = False
         self.items.clear()
-        if self.strategy.args.reuse_offline:
-            if not self.strategy.is_rank_0():
-                self.left_items.clear()
-        logger.info({
-            "INFO": "CLEAR",
-            "ITEMSIZE": len(self.items),
-            "LEFTSIZE": len(self.left_items),
-            'IS_RANK_0': self.strategy.is_rank_0()
-        })
 
     @torch.no_grad()
     def sample(self) -> Experience:
@@ -425,84 +260,73 @@ class NaiveReplayBuffer(ABC):
         return experience
 
     def __len__(self) -> int:
-        return len(self.items)
+        if self.dynamic_batch:
+            return len(self.dynamic_indices)
+        else:
+            return len(self.items)
 
     def __getitem__(self, idx: int) -> BufferItem:
-        return self.items[idx]
+        if self.dynamic_batch:
+            indices = self.dynamic_indices[idx]
+            return [self.items[i] for i in indices]
+        else:
+            return self.items[idx]
 
     def collate_fn(self, batch) -> Experience:
+        if self.dynamic_batch:
+            batch = batch[0]
         experience = make_experience_batch(batch, self.packing_samples)
         return experience
 
-    def normalize(self, attribute: str, strategy) -> None:
-        assert attribute == "advantages"
-        items = []
-        action_masks = []
-        for item in self:
-            items.append(getattr(item, attribute))
-            if item.env_mask is not None:
-                action_masks.append(item.env_mask)
-            else:
-                action_masks.append(item.action_mask)
+    def setup_dynamic_batch(self, strategy):
+        args = strategy.args
+        sample_lengths = [sample.info["total_length"] for sample in self.items]
 
-        items_vector = torch.cat(items).float().flatten()
+        world_size = dist.get_world_size()
+        dp_size = world_size // args.ring_attn_size // args.ds_tensor_parallel_size
+        local_train_batch_size = args.train_batch_size // dp_size
+        num_steps = args.rollout_batch_size * args.n_samples_per_prompt // args.train_batch_size
 
-        if action_masks[0] is None:
-            # packing samples has no action mask
-            action_masks_vector = 1
-            num_actions = items_vector.numel()
-        else:
-            action_masks_vector = torch.cat(action_masks).flatten()
-            num_actions = action_masks_vector.sum()
+        # split by train_batch_size, sync num_microbatches across dp
+        num_microbatches = []
+        for i in range(num_steps):
+            start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
+            num_microbatches.append(
+                get_minimum_num_micro_batch_size(
+                    sample_lengths[start:end],
+                    args.max_tokens_per_gpu,
+                    args.ring_attn_size,
+                    args.ds_tensor_parallel_size,
+                )
+            )
 
-        # For Data Parallel (DP)
-        # Calculate mean
-        sum_and_count = (items_vector.sum(), num_actions)
-        all_sum, all_count = (
-            strategy.all_reduce(torch.tensor(sum_and_count, device=items_vector.device), "sum")
-            if not self.gathered
-            else sum_and_count
-        )
-        mean = all_sum / all_count
-        # Calculate standard deviation
-        std = ((items_vector - mean).pow(2) * action_masks_vector).sum()
-        all_std = strategy.all_reduce(std, "sum") if not self.gathered else std
-        rstd = (all_std / all_count).clamp(min=1e-8).rsqrt()
+        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
+        num_microbatches = strategy.all_reduce(num_microbatches, op="max")
+        num_microbatches = num_microbatches.tolist()
 
-        for i, item in enumerate(self):
-            setattr(item, attribute, (items[i] - mean) * rstd)
-        self.is_normalized = True
+        # balance the number of mirobatches across steps
+        micro_batch_indices = []
+        data_partitions = []
+        for i, num_mbs in enumerate(num_microbatches):
+            start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
+            samples = sample_lengths[start:end]
+            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)  # List[List[int]], index
+            for j in range(num_mbs):
+                for k in range(len(partitions[j])):
+                    partitions[j][k] += start
+            micro_batch_indices.extend(partitions)
+            data_partitions.append(partitions)
+        self.dynamic_indices = micro_batch_indices
+        self.sample_batch_size = 1
 
-    def normalize_mean(self, attribute: str, strategy) -> None:
-        assert attribute == "advantages"
-        items = []
-        action_masks = []
-        for item in self:
-            items.append(getattr(item, attribute))
-            if item.env_mask is not None:
-                action_masks.append(item.env_mask)
-            else:
-                action_masks.append(item.action_mask)
-
-        items_vector = torch.cat(items).float().flatten()
-
-        if action_masks[0] is None:
-            # packing samples has no action mask
-            action_masks_vector = 1
-            num_actions = items_vector.numel()
-        else:
-            action_masks_vector = torch.cat(action_masks).flatten()
-            num_actions = action_masks_vector.sum()
-
-        # For Data Parallel (DP)
-        # Calculate mean
-        sum_and_count = (items_vector.sum(), num_actions)
-        all_sum, all_count = (
-            strategy.all_reduce(torch.tensor(sum_and_count, device=items_vector.device), "sum")
-            if not self.gathered
-            else sum_and_count
-        )
-        mean = all_sum / all_count
-
-        for i, item in enumerate(self):
-            setattr(item, attribute, (items[i] - mean))
+        # adjust optimizer step and loss scale
+        loss_scales = []
+        optimizer_steps = []
+        for partitions in data_partitions:
+            sample_num = sum(len(partition) for partition in partitions)
+            loss_scale = [len(partition) / sample_num for partition in partitions]
+            optimizer_step = [0] * (len(partitions) - 1) + [1]
+            loss_scales.extend(loss_scale)
+            optimizer_steps.extend(optimizer_step)
+        self.dynamic_loss_scale = loss_scales
+        self.dynamic_optimizer_step = optimizer_steps

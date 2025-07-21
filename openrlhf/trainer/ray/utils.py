@@ -1,5 +1,9 @@
 import os
 
+
+# Address https://github.com/ray-project/ray/issues/51117
+# This function is used to get the bundle indices of a placement group
+# and ensure that the bundles placed on the same node are grouped together.
 def get_bundle_indices(placement_group, index, length):
     import ray
 
@@ -11,6 +15,7 @@ def get_bundle_indices(placement_group, index, length):
 
     sorted_bundle_indices = sum(node_id_to_bundles.values(), [])
     return sorted_bundle_indices[index * length : (index + 1) * length]
+
 
 def ray_noset_visible_devices(env_vars=os.environ):
     # Refer to

@@ -46,61 +46,160 @@ The evaluation script is located at ./evaluation. You should be careful to set y
 
 - ASYNC-PIPLINE [PPO](./examples/scripts/train_long_cot_ray_7b_reinforce_baseline_tune_zero_v1_onpolicy_env_mask_async_async.sh). We have test async-rollout with pipline to incentivize the reasoning ability on math-tasks with multiturn TIR(tool-intergated-reasoning). It has been tested on 7b/32b for reinforce++ and grpo with env-mask to exclude the loss calculation for env-feedback. [Zhihu](https://zhuanlan.zhihu.com/p/1903425641954674326). It achieves better performance on AIME24/25 with fewer training-steps compared to zeor-rl-text-cot.
 - DETAIL:
-    - ./trainer/ray/async_vllm_engine_async.py(function **def add_env_pipline_requests**) for async-rollout.
-    - In order to unify the multi-turn tool rl, we further add ./openrlhf/async_pipline/process_request.py to handle different env with the **env_func** from label(suppose label is constructed via json.dumps({})). So, you just need to add different env_func as showed in /env/math/math_tir_process_single_request.py(tir) or default generation method showed in ./openrlhf/async_pipline/process_request.py(function: **def default_generate**)
-    - The make_experience.py decouples the rollout-generation and make-exp(calculate the advantages/logprob and so on.). You should focus on function **run_async_queue/gather_queue/put_queue** in ./trainer/ppo_utils/experience_maker.py
-    - The ppo-trainer.py also modified to support pipline. ./trainer/ppo_trainer.py(See function **fit**).
+    - Based on the OpenRLHF_v082 and add dynamic-batch-size feature from the latest version.
+    - The clear and simple async-rl pipline, you can check it on ./openrlhf/trainer/ppo_trainer_async.py
+    - Easy and simple task definition and intergation, you can check it on ./openrlhf/env/reward_config.py, ./openrlhf/env/filter_config.py and ./openrlhf/env/env_config.py
+    - The agentic-rl now only supports math-tir, you can check it on ./env/math/math_tir_process_single_request.py
+    - The agentic-rl needs more env and customized inference logic which is fully controlled by user without any magic-features or trivial implementations. 
+    - For agentic-rl, token-in-and-token-out is important for performance and stopping-criteria.
+    - We add nginx-file-reading for env-interactions each turn and you can change the proxy without interrupting training.
+    - For agentic-rl, filtering bad-examples is **important** for stable and long-term training, the filtering-strategy is related to task, when you define a rollout strategy, you should define a reward and filtering python file. 
 - RUNNING SCRIPT
 ```
-bash 
+# apt-get update && \
+#     apt-get install -y gosu && \
+#     rm -rf /var/lib/apt/lists/*
+
+# apt-get update && apt-get -y install sudo
+
+# export NCCL_P2P_DISABLE=1
+# export NCCL_IB_DISABLE=1
+# export NCCL_SOCKET_IFNAME=eth0
+# export NCCL_SHM_DISABLE=1
+# export NCCL_DEBUG=INFO
+
+cd your_openrlhf_path
+pip3 install -e . -i  https://mirrors.cloud.aliyuncs.com/pypi/simple --trusted-host mirrors.cloud.aliyuncs.com
+
+pip3 install deepspeed==0.17.0
+
+pip3 install math-verify loguru fastapi uvicorn httpx python-multipart aiohttp aiolimiter pysbd jsonlines coloredlogs pebble aiolimiter -i  https://mirrors.cloud.aliyuncs.com/pypi/simple --trusted-host mirrors.cloud.aliyuncs.com
+pip3 install func_timeout sentencex requests_futures timeout_decorator flashtext pygments -i  https://mirrors.cloud.aliyuncs.com/pypi/simple --trusted-host mirrors.cloud.aliyuncs.com
+
+cd your_openrlhf_path
+chmod -R 777 ./examples/scripts/
+
+ln -s your_openrlhf_path /openrlhf
+cd /openrlhf/examples/scripts
+chmod -R 777 /openrlhf/examples/scripts
+
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=1000000000
+export USE_MODEL_REWARD='yes'
+export NCCL_TIMEOUT=36000000
+export MAX_CONCURRENT=512
+export TASK_MAX_CONCURRENT=32
+export MAX_VLLM_BATCHSIZE=4
+export ENV_ITER_NUM='2'
 export WARMUP=0.0
 export LR=1e-6
 export KL=0.0
-export ENTROPY_RATIO=0.0
-export STRUCTURED_REWARD="STRUCTURED_REWARD"
-export GENERATE_METHOD='math_tir_generate'
-export DEBUG_PATH='/cpfs/user/debug/tir'
-export VLLM_USE_V1=0
-export USE_MODEL_REWARD='yes'
-export MAX_CONCURRENT=128
-export NCCL_TIMEOUT=36000000
+export OPENRLHF_PATH=your_openrlhf_path
+export OPENRLHF_ASYNC_QUEUE_SIZE=1
+export N_ROLLOUT=16
+export MAX_COMPILE_RETRIES=2
+export OPENRLHF_ASYNC_QUEUE_SIZE=1
+# export QUALITY_REWARD=0.1
+# export OVER_LONG_REWARD=0.1
+export CODE_CONCURRENT=32
+# export USE_SHORTCUT_REWARD=0.1
+# export USE_FORMAT_REWARD='yes'
+# export USE_TIR_FORMAT_LOOSE=0.1
 
-mkdir ${DEBUG_PATH}
+mkdir /newcpfs/user/chenhao/outputs/
 
-export USE_REMOTE_RM_ACTOR="RayActor"
-export CONCURRENCY='1'
-export ENV_ITER_NUM='2'
- 
-export expname=xxx/qwen25_32B_reinforce_baseline_zero_tir_fix_boxed_lr${LR}_warmup${WARMUP}_kl${KL}_zero_tir_0506_nginx_prefetch_fix_env_mask_vllm083_xverify_deepmath_async_iternum${ENV_ITER_NUM}/
-export SAVE_PATH=xxx/qwen25_32B_reinforce_baseline_zero_tir_fix_boxed_lr${LR}_warmup${WARMUP}_kl${KL}_zero_tir_0506_nginx_prefetch_fix_env_mask_vllm083_xverify_deepmath_async_iternum${ENV_ITER_NUM}/
+export SAVE_PATH=your_save_path
+export expname=${SAVE_PATH}
 
-rm -r ${expname}roll*
-
-export PRETRAIN=xxx/Qwen/Qwen2.5-32B-local/
-export REF_PRETRAIN=xxx/Qwen/Qwen2.5-32B-local/
-export REWARD_PRETRAIN=xxx/Qwen/Qwen2.5-32B-local/
-
-export PROMPT_DATA=xxx/DeepMath-103K/deepmath_103k.jsonl
-export PROMPT_DATA_PROBS='1.0'
+export PRETRAIN=base_model_path
+export REF_PRETRAIN=ref_model_path
+export DATA_PATH=data_path
 
 export TENSORBOARD=${SAVE_PATH}/tensorboard/
-export REMOTE_RM_URL='http://xxx:yyy' # remote-reward-url
-export COMPILE_SERVER='http://xxx:yyy' # remote-python-compile
+export NGINX_IP_FILE=nginx_ip_file_path
+export COMPILE_SERVER_PORT='10003'
+export MATH_VERIFY_SERVER_PORT='10008'
+export XVERIFY_MATH_MODEL_SERVER_PORT='10005'
+export REMOTE_RM_URL='http://127.0.0.0:8000'
 
 mkdir ${SAVE_PATH}
 mkdir ${TENSORBOARD}
 mkdir ${expname}
 
 export PATH=$HOME/.local/bin/:$PATH
-export TEMPLATE_NAME='ZERO_TIR'
 
 set -x
 if [ "$RANK" -eq 0 ]; then
-    ray start --head --port=6379  --include-dashboard=true --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-gpus 8 
+    ray start --head --port=6379  --include-dashboard=true --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-gpus 8
     ifconfig net0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 > $expname/node_ip.txt
     export MASTER_NODE=$(cat $expname/node_ip.txt)
     sleep 2m
-    ./train_long_cot_ray_32b_reinforce_baseline_tune_zero_v1_onpolicy_env_mask_async_async_pipline_continue.sh
+    set -x
+    ray job submit --address="http://${MASTER_NODE}:8265/" \
+        --runtime-env-json='{"working_dir": "/openrlhf"}' \
+        -- python3 -m openrlhf.cli.train_ppo_ray \
+        --ref_num_nodes 1 \
+        --ref_num_gpus_per_node 8 \
+        --actor_num_nodes 1 \
+        --actor_num_gpus_per_node 8 \
+        --vllm_num_engines 8 \
+        --vllm_tensor_parallel_size 1 \
+        --colocate_actor_ref \
+        --vllm_gpu_memory_utilization 0.9 \
+        --gamma 1.0 \
+        --l2 0.01 \
+        --async_train \
+        --dynamic_filtering \
+        --dynamic_filtering_reward_range 0.05 0.8 \
+        --eps_clip_low_high 0.22 0.28 \
+        --advantage_estimator reinforce_baseline \
+        --pretrain ${PRETRAIN} \
+        --ref_pretrain ${REF_PRETRAIN} \
+        --agent_func_path /openrlhf/examples/python/agent_func.py \
+        --save_path ${SAVE_PATH} \
+        --ckpt_path ${SAVE_PATH} \
+        --save_hf_ckpt \
+        --micro_train_batch_size 4 \
+        --train_batch_size 2048 \
+        --micro_rollout_batch_size 4 \
+        --rollout_batch_size 128 \
+        --n_samples_per_prompt ${N_ROLLOUT} \
+        --max_epochs 1 \
+        --num_episodes 100000000 \
+        --prompt_max_len 1024 \
+        --max_samples 100000000 \
+        --generate_max_len 8192 \
+        --zero_stage 3 \
+        --bf16 \
+        --init_kl_coef ${KL} \
+        --lr_warmup_ratio ${WARMUP} \
+        --actor_learning_rate ${LR} \
+        --critic_learning_rate 9e-6 \
+        --prompt_data ${DATA_PATH} \
+        --input_key query \
+        --label_key label \
+        --normalize_reward \
+        --gradient_checkpointing \
+        --use_global_token_level_loss \
+        --use_dual_policy_loss \
+        --use_filter_sample \
+        --use_dynamic_batch \
+        --use_loss_mask \
+        --use_adv_mask_after \
+        --grad_accum_dtype fp32 \
+        --use_seq_balancing \
+        --vllm_sync_backend nccl \
+        --vllm_enable_sleep \
+        --deepspeed_enable_sleep \
+        --adam_offload \
+        --flash_attn \
+        --normalize_reward \
+        --gradient_checkpointing \
+        --packing_samples \
+        --enforce_eager \
+        --load_checkpoint \
+        --save_steps 50 \
+        --use_tensorboard ${TENSORBOARD} \
+        --remote_rm_url ${REMOTE_RM_URL}
 else
     sleep 1m
     export MASTER_NODE=$(cat $expname/node_ip.txt)

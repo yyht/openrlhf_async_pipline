@@ -1,13 +1,14 @@
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from .utils import zero_pad_sequences
+from openrlhf.utils.utils import zero_pad_sequences
 
 
-def preprocess_data(data, input_template=None, input_key="input", output_key=None, apply_chat_template=None, multiturn=False):
+def preprocess_data(
+    data, input_template=None, input_key="input", output_key=None, apply_chat_template=None, multiturn=False
+):
     if apply_chat_template:
         if output_key:
             prompt_message = data[input_key]
@@ -50,7 +51,6 @@ class SFTDataset(Dataset):
         input_template=None,
         pretrain_mode=False,
         num_processors=8,  # Specify the number of processors you want to use
-        multiple_of=1,
         multiturn=False,
     ) -> None:
         super().__init__()
@@ -58,7 +58,6 @@ class SFTDataset(Dataset):
         self.strategy = strategy
         self.pretrain_mode = pretrain_mode
         self.max_length = max_length
-        self.multiple_of = multiple_of
         self.multiturn = multiturn
 
         # chat template
@@ -75,7 +74,7 @@ class SFTDataset(Dataset):
 
         # Parallel loading datasets
         processed_dataset = dataset.map(
-            self.process_data, 
+            self.process_data,
             remove_columns=dataset.column_names,
             num_proc=num_processors,
         )
@@ -91,36 +90,50 @@ class SFTDataset(Dataset):
         if self.multiturn and self.output_key:
             data[self.input_key].append(data[self.output_key])
             data[self.output_key] = None
-        
+
         if self.multiturn:
-            assert not self.output_key or not data[self.output_key], "You should put the whole trajactory into data[input_key] and do not set output_key"
+            assert (
+                not self.output_key or not data[self.output_key]
+            ), "You should put the whole trajactory into data[input_key] and do not set output_key"
             input_key = self.input_key
             apply_chat_template = self.apply_chat_template
             response_ranges = []
             for idx, message in enumerate(data[input_key]):
-                if message['role'] == 'assistant':
-                    prompt = apply_chat_template(data[input_key][: idx], tokenize=False, add_generation_prompt=True)
-                    response = apply_chat_template(data[input_key][: idx + 1], tokenize=False)[len(prompt):]
+                if message["role"] == "assistant":
+                    prompt = apply_chat_template(data[input_key][:idx], tokenize=False, add_generation_prompt=True)
+                    response = apply_chat_template(data[input_key][: idx + 1], tokenize=False)[len(prompt) :]
 
-                    start_idx = self.tokenizer(
-                        prompt,
-                        max_length=self.max_length,
-                        padding=False,
-                        truncation=True,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )["attention_mask"].int().sum().item()
-                    
-                    end_idx = start_idx + self.tokenizer(
-                        response,
-                        max_length=self.max_length,
-                        padding=False,
-                        truncation=True,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )["attention_mask"].int().sum().item() - 1
-                    response_ranges.append((start_idx, end_idx)) # left close right open
-                    
+                    start_idx = (
+                        self.tokenizer(
+                            prompt,
+                            max_length=self.max_length,
+                            padding=False,
+                            truncation=True,
+                            return_tensors="pt",
+                            add_special_tokens=False,
+                        )["attention_mask"]
+                        .int()
+                        .sum()
+                        .item()
+                    )
+
+                    end_idx = (
+                        start_idx
+                        + self.tokenizer(
+                            response,
+                            max_length=self.max_length,
+                            padding=False,
+                            truncation=True,
+                            return_tensors="pt",
+                            add_special_tokens=False,
+                        )["attention_mask"]
+                        .int()
+                        .sum()
+                        .item()
+                        - 1
+                    )
+                    response_ranges.append((start_idx, end_idx))  # left close right close
+
         prompt, response = preprocess_data(
             data,
             None if self.pretrain_mode else self.input_template,
@@ -140,21 +153,24 @@ class SFTDataset(Dataset):
                 add_special_tokens=False,
             )
             prompt_ids_len = prompt_token["attention_mask"].int().sum().item()
-
             # filter the sample whose length is greater than max_length (2 for answer length)
             if not prompt or not response or prompt_ids_len >= self.max_length - 2:
                 prompt = None
         else:
             prompt_ids_len = 0
 
-        return {"prompt": prompt, "response": response, "prompt_ids_len": prompt_ids_len, "response_ranges": response_ranges if self.multiturn else None}
+        return {
+            "prompt": prompt,
+            "response": response,
+            "prompt_ids_len": prompt_ids_len,
+            "response_ranges": response_ranges if self.multiturn else None,
+        }
 
     def __len__(self):
         length = len(self.prompts)
         return length
 
     def __getitem__(self, idx):
-        prompt_ids_len = self.prompt_ids_lens[idx]
         prompt = self.prompts[idx]
         response = self.responses[idx]
 
@@ -173,59 +189,41 @@ class SFTDataset(Dataset):
             return_tensors="pt",
             add_special_tokens=False,
         )
+        input_ids = input_token["input_ids"]
+        attention_mask = input_token["attention_mask"]
+        loss_mask = self.get_loss_mask(input_ids, idx)
 
         if not self.pretrain_mode:
             # to avoid EOS_token truncation
-            input_token["input_ids"][0][-1] = self.tokenizer.eos_token_id
-            input_token["attention_mask"][0][-1] = True
-        info = {"input": prompt, "output": response, "input_length": input_token["attention_mask"].int().sum().item(), "response_ranges": self.response_ranges[idx] if self.multiturn else None}
+            input_ids[0][-1] = self.tokenizer.eos_token_id
+            attention_mask[0][-1] = True
+        return input_ids, attention_mask, loss_mask
 
-        return prompt_ids_len, input_token["input_ids"], input_token["attention_mask"], info
+    def get_loss_mask(self, input_ids, idx):
+        if self.pretrain_mode:
+            return torch.ones_like(input_ids, dtype=torch.float32)  # shape:[1, seq_len]
+
+        loss_mask = torch.zeros_like(input_ids, dtype=torch.float32)
+        if not self.multiturn:
+            prompt_ids_len = self.prompt_ids_lens[idx]
+            loss_mask[0, prompt_ids_len - 1 : -1] = 1
+        else:
+            response_ranges = self.response_ranges[idx]
+            for start_idx, end_idx in response_ranges:
+                loss_mask[0, start_idx - 1 : end_idx] = 1
+        return loss_mask
 
     def collate_fn(self, item_list):
-        prompt_ids_lens = []
         input_ids = []
         attention_masks = []
-        infos = {"input": [], "output": []}
+        loss_masks = []
 
-        for prompt_ids_len, input_id, attention_mask, info in item_list:
-            prompt_ids_lens.append(prompt_ids_len)
+        for input_id, attention_mask, loss_mask in item_list:
             input_ids.append(input_id)
             attention_masks.append(attention_mask)
-            infos["input"].append(info["input"])
-            infos["output"].append(info["output"])
+            loss_masks.append(loss_mask)
 
         input_ids = zero_pad_sequences(input_ids, "right", self.tokenizer.pad_token_id)
         attention_masks = zero_pad_sequences(attention_masks, "right")
-        return prompt_ids_lens, input_ids, attention_masks, infos
-
-    def packing_collate_fn(self, item_list):
-        packed_input_ids = []
-        packed_attention_masks = []
-        prompt_ids_lens = []
-        infos = {"input_length": [], "response_ranges": [] if self.multiturn else None}
-        index = 1
-        for prompt_ids_len, input_id, attention_mask, info in item_list:
-            packed_input_ids.append(input_id.flatten())
-            packed_attention_masks.append(torch.full_like(input_id.flatten(), index))
-            prompt_ids_lens.append(prompt_ids_len)
-            infos["input_length"].append(info["input_length"])
-            if self.multiturn:
-                if len(infos["response_ranges"]) >= 1:
-                    for i in range(len(info["response_ranges"])):
-                        info["response_ranges"][i][0] += infos["response_ranges"][-1][-1][1] # end_index of the last response of the last item
-                        info["response_ranges"][i][1] += infos["response_ranges"][-1][-1][1]
-                infos["response_ranges"].append(info["response_ranges"])
-            index += 1
-
-        packed_input_ids = torch.cat(packed_input_ids, dim=0).unsqueeze(0)
-        packed_attention_masks = torch.cat(packed_attention_masks, dim=0).unsqueeze(0)
-
-        if (
-            self.multiple_of > 1 and packed_input_ids.numel() % self.multiple_of != 0
-        ):  # not divisible by multiple_of; here we align for grouping
-            padding_len = self.multiple_of - (packed_input_ids.numel() % self.multiple_of)
-            packed_input_ids = F.pad(packed_input_ids, (0, padding_len), value=self.tokenizer.pad_token_id)
-            packed_attention_masks = F.pad(packed_attention_masks, (0, padding_len), value=0)
-
-        return prompt_ids_lens, packed_input_ids, packed_attention_masks, infos
+        loss_masks = zero_pad_sequences(loss_masks, "right")
+        return input_ids, attention_masks, loss_masks

@@ -1,71 +1,111 @@
-import itertools
 import math
 import os
 import socket
-from typing import Callable, Dict, List
+from abc import ABC
+from typing import Dict, List, Optional, Union
 
 import deepspeed
 import ray
 import torch
 import torch.distributed
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
-from openrlhf.datasets import PromptDataset, SFTDataset
-from openrlhf.models import Actor
-from openrlhf.trainer import PPOTrainer
-from openrlhf.trainer.ppo_utils import Experience, RemoteExperienceMaker
-from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-from openrlhf.utils import blending_datasets, get_tokenizer
+from openrlhf.models import Actor, PolicyLoss
+from openrlhf.models.utils import compute_approx_kl, masked_mean
+from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
-from openrlhf.utils.distributed_util import init_process_group
+from openrlhf.utils.distributed_util import init_process_group, torch_dist_barrier_and_cuda_sync
+from openrlhf.utils.logging_utils import init_logger
+from openrlhf.trainer.ppo_utils.seqlen_balancing import get_seqlen_balanced_partitions
+from openrlhf.models.dpg import DPGLoss
+from openrlhf.models.loss import CISPolicyLoss, DualPolicyLoss
+
+from ..ppo_utils import NaiveReplayBuffer
+
+logger = init_logger(__name__)
 
 from .launcher import BasePPORole
 from .utils import get_physical_gpu_id
 
-from openrlhf.utils.logging_utils import init_logger
-import threading
 
-logger = init_logger(__name__)
-
-class ActorPPOTrainer(PPOTrainer):
+class ActorPPOTrainer(ABC):
     def __init__(
         self,
-        *args,
+        strategy,
+        actor: Actor,
+        ema_model: Actor,
+        actor_optim: Optimizer,
+        actor_scheduler,
+        ema_beta: float = 0.992,
+        micro_train_batch_size: int = 8,
+        buffer_limit: int = 0,
+        buffer_cpu_offload: bool = True,
+        eps_clip: float = 0.2,
+        tokenizer=None,
+        dataloader_pin_memory: bool = True,
         vllm_engines: List = None,
-        remote_rm_url: List[str] = None,
-        critic_train_remote: bool = False,
         **kwargs,
     ):
         """PPOTrainer for ray.
 
         Args:
             vllm_engines (List, optional): vllm engines for text generation, if not specified, generate text by actor model directly. Defaults to None.
-            critic_train_remote (bool, optional): whether this actor should triger corresponding critic model training. Defaults to False.
         """
-        super().__init__(*args, **kwargs)
-        self.remote_rm_url = remote_rm_url
-        self.vllm_engines = vllm_engines
-        self.critic_train_remote = critic_train_remote
+        self.strategy = strategy
+        self.args = strategy.args
+        self.tokenizer = tokenizer
+        self.generate_kwargs = kwargs
+        self.dataloader_pin_memory = dataloader_pin_memory
+        self.micro_train_batch_size = micro_train_batch_size
+        self.ema_beta = ema_beta
 
-        self.experience_maker = RemoteExperienceMaker(
-            self.actor,
-            self.critic,
-            self.reward_model,
-            self.initial_model,
-            self.tokenizer,
-            self.prompt_max_len,
-            self.kl_ctl,
-            self.strategy,
-            self.remote_rm_url,
-            self.reward_fn,
-            vllm_engines=self.vllm_engines,
-            packing_samples=self.strategy.args.packing_samples,
+        self.actor = actor
+        self.ema_model = ema_model
+        self.actor_optim = actor_optim
+        self.actor_scheduler = actor_scheduler
+        self.vllm_engines = vllm_engines
+        self.max_epochs = self.args.max_epochs
+
+        self.actor_loss_fn = PolicyLoss(
+            clip_eps_low=self.args.eps_clip_low_high[0],
+            clip_eps_high=self.args.eps_clip_low_high[1],
         )
 
+        self.dpg_loss_fn = DPGLoss(
+            clip_eps_low=self.args.eps_clip_low_high[0],
+            clip_eps_high=self.args.eps_clip_low_high[1],
+        )
+
+        self.actor_cispo_loss_fn = CISPolicyLoss(
+            clip_eps_low=self.args.eps_clip_low_high[0],
+            clip_eps_high=self.args.eps_clip_low_high[1],
+        )
+
+        self.actor_dual_policy_loss_fn = DualPolicyLoss(
+            clip_eps_low=self.args.eps_clip_low_high[0],
+            clip_eps_high=self.args.eps_clip_low_high[1],
+        )
+
+        # Mixtral 8x7b
+        self.aux_loss = self.args.aux_loss_coef > 1e-8
+
+        self.replay_buffer = NaiveReplayBuffer(
+            micro_train_batch_size, 
+            buffer_limit, 
+            buffer_cpu_offload, 
+            getattr(self.args, "packing_samples", False),
+            self.args.use_dynamic_batch,
+        )
+
+        # Init torch group for weights sync
         backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
         self.use_cuda_ipc = False
-        if backend == "nccl" and self.strategy.args.colocate_all_models:
+        if backend == "nccl" and self.args.colocate_all_models and not self.args.async_train:
             self.use_cuda_ipc = True
 
         # Create torch group with deepspeed rank 0 and all vllm ranks
@@ -123,101 +163,218 @@ class ActorPPOTrainer(PPOTrainer):
 
             ray.get(refs)
 
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
 
-    def ppo_train(self, global_steps, **kwargs):
-        # 1. ensure all experience makers done
-        self.experience_maker.flush()
-        torch.distributed.barrier()
-        status = {}
+    def ppo_train(self, kl_ctl: float, global_response_length=None):
+        # replay buffer may be empty at first, we should rebuild at each training
+        # not_shuffle = self.strategy.ring_attn_group is not None or self.args.ds_tensor_parallel_size > 1
+        # dataloader = DataLoader(
+        #     self.replay_buffer,
+        #     batch_size=self.replay_buffer.sample_batch_size,
+        #     shuffle=not not_shuffle,
+        #     drop_last=True,
+        #     pin_memory=self.dataloader_pin_memory,
+        #     collate_fn=self.replay_buffer.collate_fn,
+        # )
 
-        # 2. triger remote critic model training
-        if self.critic_train_remote:
-            # sync for deepspeed_enable_sleep
-            if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic.reload_states.remote())
+        if self.args.use_dynamic_batch:
+            self.replay_buffer.setup_dynamic_batch(self.strategy)
 
-            # sync replay-buffer from actor to critic
-            if self.strategy.args.use_acc_filter or self.strategy.args.global_shuffle:
-                if global_steps > self.freezing_actor_steps:
-                    self.critic.replay_buffer_reset.remote(self.replay_buffer)
-                    torch.distributed.barrier()
-            
-            critic_status_ref = self.critic.fit.remote()
+        not_shuffle = (
+            self.strategy.ring_attn_group is not None
+            or self.args.ds_tensor_parallel_size > 1
+            or self.args.use_dynamic_batch
+        )
+        dataloader = DataLoader(
+            self.replay_buffer,
+            batch_size=self.replay_buffer.sample_batch_size,
+            shuffle=not not_shuffle,
+            drop_last=True,
+            pin_memory=self.dataloader_pin_memory,
+            collate_fn=self.replay_buffer.collate_fn,
+        )
 
-            if self.strategy.args.colocate_all_models or self.strategy.args.deepspeed_enable_sleep:
-                status.update(ray.get(critic_status_ref))
-            if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic.offload_states.remote())
+        device = torch.cuda.current_device()
 
-        if self.strategy.args.colocate_all_models:
-            torch.distributed.barrier()
+        if self.args.use_dynamic_bs_ds:
+            accumulation_steps = len(dataloader)
+        else:
+            accumulation_steps = None
 
-        # 3. actor model training
-        if global_steps > self.freezing_actor_steps:
-            if self.strategy.args.deepspeed_enable_sleep:
-                self.reload_states()
+        status_list = []
+        status_mean = {}
+        for epoch in range(self.max_epochs):
+            pbar = tqdm(
+                dataloader,
+                desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
+                disable=not self.strategy.is_rank_0(),
+            )
+            for local_step, experience in enumerate(pbar):
+                experience.to_device(device)
+                status = self.training_step(experience, kl_ctl, 
+                                        step=local_step,
+                                        local_step=local_step, 
+                                        global_response_length=global_response_length,
+                                        accumulation_steps=accumulation_steps)
+                length_metric_keys = ['kl', 'entropy_loss', 'base_entropy', 'action_entropy', 'ff_influence', 'self_certainty']
+                for key in length_metric_keys:
+                    if key in status:
+                        status[key] *= status["response_length"]
+                status = self.strategy.all_reduce(status)
+                for key in length_metric_keys:
+                    if key in status:
+                        status[key] /= status["response_length"]
 
-            if not self.replay_buffer.is_normalized:
-                if self.strategy.args.advantage_estimator not in ["group_norm", "control_variate", "control_variate_f_div"]:
-                    if self.strategy.args.normalize_mean:
-                        self.replay_buffer.normalize_mean("advantages", self.strategy)
-                    self.replay_buffer.normalize("advantages", self.strategy)
+                short_status = {
+                    "act_loss": status["policy_loss"],
+                    "reward": status["reward"],
+                    "return": status["return"],
+                    "gen_len": status["response_length"],
+                    "tot_len": status["total_length"],
+                    "kl": status["kl"],
+                    "act_lr": status["actor_lr"],
+                }
 
-            status.update(super().ppo_train(global_steps, **kwargs))
+                if "entropy_loss" in status:
+                    short_status["ent_loss"] = status["entropy_loss"]
 
-            if self.strategy.args.deepspeed_enable_sleep:
-                self.offload_states()
+                status_list.append(status)
+                pbar.set_postfix(short_status)
 
-            if kwargs.get('async_gatherd', None) is not None:
-                async_gatherd = kwargs.pop('async_gatherd')
-                if async_gatherd:
-                    is_succeeded = self.experience_maker.gather_queue(async_gatherd[0], async_gatherd[1], async_gatherd[2], async_gatherd[3])
-                    queue_size = self.experience_maker.get_queue_size()
-                    logger.info({
-                        'INFO': '##AFTER-TRAIN-ASYNC-GATHER-QUEUE-SIZE##',
-                        'QUEUE_SIZE': queue_size
-                    })
-                    torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
 
-            logger.info({
-                'INFO': '##BEGIN-EMPTY-CACHE##',
-            })
+        if status_list:
+            status_mean = status_list[0]
+            for m in status_list[1:]:
+                for k, v in m.items():
+                    status_mean[k] += v
+            for k in status_mean.keys():
+                status_mean[k] /= len(status_list)
+        return status_mean
 
-            torch.cuda.empty_cache()
-            torch.distributed.barrier()
+    def training_step(self, experience: Experience, kl_ctl: float, step: int, local_step=None, global_response_length=None, accumulation_steps=None) -> Dict[str, float]:
+        self.actor.train()
 
-            logger.info({
-                'INFO': '##BEGIN-UPDATE-VLLM##',
-            })
+        sequences = experience.sequences
+        action_mask = experience.action_mask
+        attention_mask = experience.attention_mask
+        packed_seq_lens = None
+        old_action_log_probs = experience.action_log_probs
+        advantages = experience.advantages
+        base_action_log_probs = experience.base_action_log_probs
+        loss_mask = experience.loss_mask
 
-            # 4. broadcast weights to vllm engines
-            if self.vllm_engines is not None:
-                if self.strategy.args.vllm_enable_sleep:
-                    batch_vllm_engine_call(self.vllm_engines, "wake_up")
+        # actor loss
+        action_log_probs, output = self.actor(
+            sequences,
+            action_mask,
+            attention_mask=attention_mask,
+            return_output=True,
+            ring_attn_group=self.strategy.ring_attn_group,
+            packed_seq_lens=packed_seq_lens,
+            return_entropy=True,
+        )
 
-                torch.distributed.barrier()
-                torch.cuda.synchronize()
-                self._broadcast_to_vllm()
+        clip_ratio_dict = {}
 
-                if self.strategy.args.vllm_enable_sleep:
-                    batch_vllm_engine_call(self.vllm_engines, "sleep")
-                    torch.distributed.barrier()
-                    torch.cuda.synchronize()
-                
-                logger.info({
-                    'INFO': '##SUCCEEDED-IN-UPDATING-VLLM##',
-                })
+        # loss function
+        if self.args.advantage_estimator in ["dpg"]:
+            actor_loss = self.dpg_loss_fn(
+                action_log_probs,
+                old_action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+                global_response_length=global_response_length,
+                loss_mask=loss_mask
+            )
+        elif self.args.use_cispo:
+            actor_loss, clip_ratio_dict = self.actor_cispo_loss_fn(
+                action_log_probs,
+                old_action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+                global_response_length=global_response_length,
+                loss_mask=loss_mask
+            )
+        elif self.args.use_dual_policy_loss:
+            actor_loss, clip_ratio_dict = self.actor_dual_policy_loss_fn(
+                action_log_probs,
+                old_action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+                global_response_length=global_response_length,
+                loss_mask=loss_mask
+            )
+        else:
+            actor_loss, clip_ratio_dict = self.actor_loss_fn(
+                action_log_probs,
+                old_action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+                global_response_length=global_response_length,
+                entropy=output.entropy,
+                use_adv_shaping=self.args.use_adv_shaping,
+                entropy_shape_alpha=self.args.entropy_shape_alpha,
+                entropy_shape_kappa=self.args.entropy_shape_kappa,
+                loss_mask=loss_mask
+            )
+        
+        for clip_ratio_key in clip_ratio_dict:
+            experience.info[clip_ratio_key] = clip_ratio_dict[clip_ratio_key].detach()
 
-        # 5. wait remote critic model training done
-        if self.critic_train_remote and not self.strategy.args.colocate_all_models:
-            status.update(ray.get(critic_status_ref))
-        torch.distributed.barrier()
+        if self.args.use_kl_loss:
+            if self.args.init_kl_coef > 0:
+                kl = compute_approx_kl(
+                    action_log_probs,
+                    base_action_log_probs,
+                    kl_estimator=self.args.kl_estimator,
+                )
+            else:
+                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
+            kl_loss = masked_mean(kl, experience.action_mask)
+            experience.info["kl"] = kl_loss.detach()
+        else:
+            kl_loss = 0
 
+        loss = actor_loss + kl_loss * kl_ctl
+        # mixtral
+        if self.aux_loss:
+            loss += output.aux_loss * self.args.aux_loss_coef
+        # entropy loss
+        entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+        if self.args.entropy_loss_coef > 1e-8:
+            loss -= entropy_loss * self.args.entropy_loss_coef
+
+        if self.args.use_dynamic_bs_ds:
+            if not self.args.use_global_token_level_loss:
+                loss = loss / accumulation_steps
+            self.strategy.backward(loss, self.actor, self.actor_optim, scale_by_manual=True)
+            if (local_step + 1) % accumulation_steps == 0:
+                self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+        elif self.args.use_dynamic_batch:
+            if not self.args.use_global_token_level_loss:
+                loss = loss * self.replay_buffer.dynamic_loss_scale[step]
+            self.strategy.backward(loss, self.actor, self.actor_optim, scale_by_manual=True)
+            if self.replay_buffer.dynamic_optimizer_step[step]:
+                self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+        else:
+            self.strategy.backward(loss, self.actor, self.actor_optim, scale_by_manual=self.args.use_global_token_level_loss)
+            self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+        
+        if self.ema_model:
+            if self.args.use_dynamic_batch:
+                if self.replay_buffer.dynamic_optimizer_step[step]:
+                    self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
+            else:
+                self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
+
+        # status
+        status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+        status["entropy_loss"] = entropy_loss.detach().item()
+        status["loss_mask"] = loss_mask.mean().item()
+        for k, v in experience.info.items():
+            status[k] = v.mean().item()
         return status
-
-    def training_step(self, experience: Experience, global_steps, length_status=None) -> Dict[str, float]:
-        return self.training_step_actor(experience, length_status=length_status)
 
     def _broadcast_to_vllm(self):
         use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
@@ -227,147 +384,94 @@ class ActorPPOTrainer(PPOTrainer):
             for engine in self.vllm_engines:
                 cache_reset_refs.append(engine.reset_prefix_cache.remote())
 
-        logger.info({
-            'INFO': '##BEGIN-UPDATE-VLLM-EMPTY-CACHE##',
-        })
-
         torch.cuda.empty_cache()
-
-        logger.info({
-            'INFO': '##END-UPDATE-VLLM-EMPTY-CACHE##',
-        })
-
         model = self.actor.model.module
         count, num_params = 0, len(list(model.named_parameters()))
+
+        logger.info(f"broadcasting parameters to all ranks...")
+
+        def _broadcast_param(param, count, num_params):
+            use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+            # Fire all vllm engines for broadcast
+            if torch.distributed.get_rank() == 0:
+                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                refs = [
+                    engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+                    for engine in self.vllm_engines
+                ]
+
+                if use_ray:
+                    import ray.util.collective as collective
+
+                    collective.broadcast(param.data, 0, group_name=self._model_update_group)
+                else:
+                    torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
+                ray.get(refs)
+
+        def _handle_cuda_ipc(param, count, num_params):
+            from torch.multiprocessing.reductions import reduce_tensor
+
+            weight = param.data.clone()
+            ipc_handle = reduce_tensor(weight)
+
+            ipc_handle = {get_physical_gpu_id(): ipc_handle}
+            ipc_handle_list = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
+
+            if torch.distributed.get_rank() == 0:
+                ipc_handles = {}
+                for d in ipc_handle_list:
+                    ipc_handles.update(d)
+
+                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                refs = [
+                    engine.update_weight_cuda_ipc.remote(
+                        name,
+                        dtype=param.dtype,
+                        shape=shape,
+                        ipc_handles=ipc_handles,
+                        empty_cache=count == num_params,
+                    )
+                    for engine in self.vllm_engines
+                ]
+                ray.get(refs)
+            torch_dist_barrier_and_cuda_sync()
+
         for name, param in model.named_parameters():
             count += 1  # empty_cache at last param
 
             # broadcast
             if not self.use_cuda_ipc:
-                use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
-                # Fire all vllm engines for broadcast
-                if torch.distributed.get_rank() == 0:
-                    shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                    refs = [
-                        engine.update_weight.remote(
-                            name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
-                        )
-                        for engine in self.vllm_engines
-                    ]
-
                 # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                    if torch.distributed.get_rank() == 0:
-                        if use_ray:
-                            import ray.util.collective as collective
-
-                            collective.broadcast(param.data, 0, group_name=self._model_update_group)
-                        else:
-                            torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
-                        ray.get(refs)
+                if self.strategy.args.ds_tensor_parallel_size > 1:
+                    with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
+                        _broadcast_param(param, count, num_params)
+                else:
+                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                        _broadcast_param(param, count, num_params)
             # CUDA IPC
             else:
-                from torch.multiprocessing.reductions import reduce_tensor
-
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                    weight = param.data.clone()
-                    ipc_handle = reduce_tensor(weight)
-
-                    ipc_handle = {get_physical_gpu_id(): ipc_handle}
-                    ipc_handle_list = [None] * torch.distributed.get_world_size()
-                    torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
-
-                    if torch.distributed.get_rank() == 0:
-                        ipc_handles = {}
-                        for d in ipc_handle_list:
-                            ipc_handles.update(d)
-
-                        shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                        refs = [
-                            engine.update_weight_cuda_ipc.remote(
-                                name,
-                                dtype=param.dtype,
-                                shape=shape,
-                                ipc_handles=ipc_handles,
-                                empty_cache=count == num_params,
-                            )
-                            for engine in self.vllm_engines
-                        ]
-                        ray.get(refs)
-                    torch.distributed.barrier()
-                    torch.cuda.synchronize()
+                if self.strategy.args.ds_tensor_parallel_size > 1:
+                    with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
+                        _handle_cuda_ipc(param, count, num_params)
+                else:
+                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                        _handle_cuda_ipc(param, count, num_params)
 
         if cache_reset_refs:
             ray.get(cache_reset_refs)
         torch.cuda.empty_cache()
-        torch.distributed.barrier()
-
-    def ref_ema(self, beta=0.992):
-        # avoid OOM
-        self.strategy.time_steps["ref_ema"] += 1
-        if self.strategy.time_steps["ref_ema"] % self.strategy.accumulated_gradient == 0:
-            torch.cuda.empty_cache()
-            model = self.actor.model
-
-            count, num_params = 0, len(list(model.named_parameters()))
-
-            with torch.no_grad():
-                for (param_name, param) in list(model.named_parameters()):
-                    if param.requires_grad:
-                        with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                            data = param.data
-
-                        if torch.distributed.get_rank() == 0:
-                            refs = [self.initial_model.ema_update.remote(param_name, data, beta=beta)]
-                            ray.get(refs)
-            
-            torch.distributed.barrier()
-            self.strategy.print({
-                'REFEMA': "SUCCESS"
-            })
-
-    def _save_checkpoint(self, args, tag, client_states):
-        # call remote critic
-        refs = []
-        if not self.disable_ds_ckpt:
-            if self.critic_train_remote:
-                refs = [self.critic.save_checkpoint.remote(tag)]
-                if self.save_hf_ckpt:
-                    refs.append(self.critic.save_model.remote())
-
-            self.strategy.save_ckpt(
-                self.actor.model,
-                os.path.join(args.ckpt_path, "_actor"),
-                tag,
-                args.max_ckpt_num,
-                args.max_ckpt_mem,
-                client_states,
-            )
-        if self.save_hf_ckpt:
-            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
-            self.strategy.save_model(
-                self.ema_model if args.enable_ema else self.actor,
-                self.tokenizer,
-                save_path,
-            )
-        # wait
-        if not self.disable_ds_ckpt:
-            if self.critic_train_remote:
-                ray.get(refs)
-        torch.distributed.barrier()
-
-    def reload_states(self):
-        reload_deepspeed_states(self.actor.model)
-
-    def offload_states(self):
-        offload_deepspeed_states(self.actor.model)
+        torch_dist_barrier_and_cuda_sync()
 
 
 @ray.remote(num_gpus=1)
 class ActorModelRayActor(BasePPORole):
-    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps, vllm_engines):
         args = strategy.args
+        self.save_hf_ckpt = args.save_hf_ckpt
+        self.disable_ds_ckpt = args.disable_ds_ckpt
+        self.vllm_engines = vllm_engines
+        self.max_steps = max_steps
 
         if getattr(args, "vllm_num_engines", 0) > 0:
             # To prevent hanging during NCCL synchronization of weights between DeepSpeed and vLLM.
@@ -388,6 +492,8 @@ class ActorModelRayActor(BasePPORole):
             lora_dropout=strategy.args.lora_dropout,
             ds_config=strategy.get_ds_train_config(is_actor=True),
             packing_samples=strategy.args.packing_samples,
+            temperature=strategy.args.temperature,
+            use_liger_kernel=strategy.args.use_liger_kernel,
         )
         strategy.print(actor)
 
@@ -412,16 +518,6 @@ class ActorModelRayActor(BasePPORole):
         actor_optim = strategy.create_optimizer(
             actor, lr=args.actor_learning_rate, betas=strategy.args.adam_betas, weight_decay=args.l2
         )
-
-        # prepare_datasets
-        self.prepare_datasets()
-
-        # configure scheduler
-        self.num_update_steps_per_episodes = (
-            len(self.prompts_dataset) * args.n_samples_per_prompt // args.train_batch_size * args.max_epochs
-        )
-        max_steps = math.ceil(args.num_episodes * self.num_update_steps_per_episodes)
-        self._max_steps = max_steps
 
         actor_scheduler = get_scheduler(
             "cosine_with_min_lr",
@@ -449,164 +545,42 @@ class ActorModelRayActor(BasePPORole):
             self.ema_model = None
 
         # load checkpoint
-        self.consumed_samples = 0
+        self.checkpoint_states = {}
         ckpt_path = os.path.join(args.ckpt_path, "_actor")
         if args.load_checkpoint and os.path.exists(ckpt_path):
+            strategy.print(f"Loading the checkpoint: {ckpt_path}")
             _, states = strategy.load_ckpt(self.actor.model, ckpt_path)
-            self.consumed_samples = states["consumed_samples"]
-            strategy.print(f"Loaded the checkpoint: {ckpt_path}, consumed_samples: {self.consumed_samples}")
+            self.checkpoint_states["global_step"] = states["global_step"]
+            self.checkpoint_states["episode"] = states["episode"]
+            self.checkpoint_states["data_loader_state_dict"] = states["data_loader_state_dict"]
 
         # initial offload
         if strategy.args.deepspeed_enable_sleep:
             offload_deepspeed_states(self.actor.model)
 
-    def prepare_datasets(self):
-        strategy = self.strategy
-        args = self.strategy.args
-
-        # prepare datasets
-        prompts_data = blending_datasets(
-            args.prompt_data,
-            args.prompt_data_probs,
-            strategy,
-            args.seed,
-            max_count=args.max_samples,
-            return_eval=False,
-            train_split=args.prompt_split,
-        )
-        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
-        self.prompts_dataset = PromptDataset(
-            prompts_data, self.tokenizer, strategy, input_template=args.input_template
-        )
-        self.prompts_dataloader = strategy.setup_dataloader(
-            self.prompts_dataset,
-            args.rollout_batch_size // (strategy.world_size // strategy.ring_attn_size),
-            True,
-            True,
-        )
-
-        if args.pretrain_data:
-            pretrain_data = blending_datasets(
-                args.pretrain_data,
-                args.pretrain_data_probs,
-                strategy,
-                args.seed,
-                return_eval=False,
-                train_split=args.pretrain_split,
-            )
-            pretrain_max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
-            pretrain_dataset = SFTDataset(
-                pretrain_data.select(
-                    range(
-                        min(
-                            len(pretrain_data), args.max_epochs * len(self.prompts_dataset) * args.n_samples_per_prompt
-                        )
-                    )
-                ),
-                self.tokenizer,
-                pretrain_max_len,
-                strategy,
-                pretrain_mode=True,
-            )
-            self.pretrain_dataloader = itertools.cycle(
-                iter(
-                    strategy.setup_dataloader(
-                        pretrain_dataset,
-                        args.micro_train_batch_size,
-                        True,
-                        True,
-                        pretrain_dataset.collate_fn,
-                    )
-                )
-            )
-        else:
-            self.pretrain_dataloader = None
-
-    def max_steps(self):
-        """Return the maximum number of steps."""
-        return self._max_steps
-
-    def fit(
-        self,
-        critic_model: ray.actor.ActorHandle,
-        initial_model: ray.actor.ActorHandle,
-        reward_model: List[ray.actor.ActorHandle],
-        remote_rm_url: List[str] = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        vllm_engines: List[ray.actor.ActorHandle] = None,
-        critic_train_remote: bool = False,
-    ):
-        """Train actor model with prompt datasets."""
-        strategy = self.strategy
-        args = self.strategy.args
-
         # configure Trainer
-        trainer = ActorPPOTrainer(
+        self.trainer = ActorPPOTrainer(
             strategy,
             self.actor,
-            critic_model,
-            reward_model,
-            initial_model,
             ema_model=self.ema_model,
-            actor_optim=None,
-            critic_optim=None,
+            actor_optim=self.actor_optim,
             actor_scheduler=self.actor_scheduler,
-            critic_scheduler=None,
-            remote_rm_url=remote_rm_url,
-            reward_fn=reward_fn,
-            vllm_engines=vllm_engines,
-            max_epochs=args.max_epochs,
             micro_train_batch_size=args.micro_train_batch_size,
-            micro_rollout_batch_size=args.micro_rollout_batch_size,
-            gradient_checkpointing=args.gradient_checkpointing,
-            critic_train_remote=critic_train_remote,
             tokenizer=self.tokenizer,
-            prompt_max_len=args.prompt_max_len,
-            value_clip=args.value_clip,
             eps_clip=args.eps_clip,
-            gamma=args.gamma,
-            lambd=args.lambd,
-            init_kl_coef=args.init_kl_coef,
-            kl_target=args.kl_target,
-            ema_beta=0.992,
-            ptx_coef=args.ptx_coef,
-            max_norm=args.max_norm,
-            # fro GPT generation
-            do_sample=True,
-            max_new_tokens=args.generate_max_len,
-            max_length=args.max_len,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            save_hf_ckpt=args.save_hf_ckpt,
-            disable_ds_ckpt=args.disable_ds_ckpt,
+            ema_beta=args.ema_beta,
+            vllm_engines=self.vllm_engines,
         )
 
-        # broadcast checkpoint
-        ckpt_path = os.path.join(args.ckpt_path, "_actor")
-        if args.load_checkpoint and os.path.exists(ckpt_path) and not vllm_engines is None:
-            # vLLM wakeup when vllm_enable_sleep
-            if self.strategy.args.vllm_enable_sleep:
-                batch_vllm_engine_call(self.vllm_engines, "wake_up")
-            torch.distributed.barrier()
-            torch.cuda.synchronize()
-
-            trainer._broadcast_to_vllm()
-
-            # vLLM offload when vllm_enable_sleep
-            if self.strategy.args.vllm_enable_sleep:
-                batch_vllm_engine_call(self.vllm_engines, "sleep")
-                torch.distributed.barrier()
-                torch.cuda.synchronize()
-
-        trainer.fit(
-            args,
-            self.prompts_dataloader,
-            self.pretrain_dataloader,
-            self.consumed_samples,
-            self.num_update_steps_per_episodes,
-        )
+    def fit(self, kl_ctl: float = 0, global_response_length=None):
+        """Train actor model with the replay buffer."""
+        torch.cuda.empty_cache()
+        self.actor.train()
+        status = self.trainer.ppo_train(kl_ctl, global_response_length=global_response_length)
+        self.trainer.replay_buffer.clear()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return status
 
     def save_model(self):
         args = self.strategy.args
@@ -617,3 +591,88 @@ class ActorModelRayActor(BasePPORole):
             self.tokenizer,
             args.save_path,
         )
+
+    def forward(
+        self,
+        sequences: torch.LongTensor,
+        action_mask: Optional[Union[int, list[int]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_lens=None,
+        return_logits=False,
+    ) -> torch.Tensor:
+        """Generates actor values."""
+        device = torch.cuda.current_device()
+        self.actor.eval()
+        with torch.no_grad():
+            if not return_logits:
+                action_log_probs = self.actor(
+                    sequences.to(device),
+                    action_mask.to(device),
+                    attention_mask.to(device),
+                    ring_attn_group=self.strategy.ring_attn_group,
+                )
+            else:
+                actor_output_dict = self.actor(
+                    sequences.to(device),
+                    action_mask.to(device),
+                    attention_mask.to(device),
+                    ring_attn_group=self.strategy.ring_attn_group,
+                    return_logits=True,
+                )
+            
+        self.actor.train()  # reset model state
+        if not return_logits:
+            return {
+                'action_log_probs': action_log_probs.to("cpu")
+            }
+        else:
+            action_logits = actor_output_dict['action_logits']
+            self_certainty = torch.logsumexp(action_logits, dim=-1) - action_logits.mean(dim=-1)
+            return {
+                'action_log_probs': actor_output_dict['action_log_probs'].to("cpu"),
+                'self_certainty': self_certainty.squeeze(dim=-1).to("cpu"),
+                'entropy': actor_output_dict['entropy'].to("cpu")
+            }
+
+    def broadcast_to_vllm(self):
+        self.trainer._broadcast_to_vllm()
+
+    def get_checkpoint_states(self):
+        return self.checkpoint_states
+
+    def append(self, experience: Experience):
+        self.trainer.replay_buffer.append(experience)
+
+    def reload_states(self):
+        reload_deepspeed_states(self.actor.model)
+
+    def offload_states(self):
+        offload_deepspeed_states(self.actor.model)
+
+    def save_checkpoint(self, tag, client_states):
+        args = self.strategy.args
+        self.strategy.save_ckpt(
+            self.actor.model,
+            os.path.join(args.ckpt_path, "_actor"),
+            tag,
+            args.max_ckpt_num,
+            args.max_ckpt_mem,
+            client_states,
+        )
+        if self.save_hf_ckpt:
+            save_path = os.path.join(args.ckpt_path, f"{tag}_hf_actor")
+            self.strategy.save_model(
+                self.actor,
+                self.tokenizer,
+                save_path,
+            )
+
+            if args.enable_ema:
+                save_path = os.path.join(args.ckpt_path, f"{tag}_hf_actor_ema")
+                self.strategy.save_model(
+                    self.ema_model,
+                    self.tokenizer,
+                    save_path,
+                )
+        # wait
+        torch_dist_barrier_and_cuda_sync()

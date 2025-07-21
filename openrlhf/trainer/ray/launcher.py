@@ -1,19 +1,17 @@
 import logging
 import os
 import socket
-from typing import Callable, Dict, List, Optional, Type
+from typing import Dict, Optional, Type
 
 import ray
 import torch
-import torch.distributed as dist
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tqdm import tqdm
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
-
-import deepspeed
 
 
 class DistributedTorchRayActor:
@@ -62,6 +60,46 @@ class BasePPORole(DistributedTorchRayActor):
     def init_model_from_pretrained(self, *args, **kwargs):
         raise NotImplementedError()
 
+    def empty_cache(self) -> None:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def execute_batch(self, method_name: str, all_data, start_idx, end_idx):
+        """Process input data by calling specified function for each item in the lists.
+
+        Args:
+            method_name (str): Name of the function to execute
+            kwargs: Reference to the chunk of data to process
+
+        Returns:
+            List[Any]: List of results from function execution
+        """
+
+        # Get the first parameter to determine list length
+        kwargs = {key: value[start_idx:end_idx] for key, value in all_data.items()}
+        first_param = next(iter(kwargs.values()))
+        list_length = len(first_param)
+
+        # Verify all parameters have same length
+        for param_name, param_value in kwargs.items():
+            if len(param_value) != list_length:
+                raise ValueError(f"Parameter {param_name} has length {len(param_value)}, expected {list_length}")
+
+        # Get the function to execute
+        func = getattr(self, method_name)
+        if not callable(func):
+            raise ValueError(f"Function {method_name} is not callable")
+
+        results = []
+        for i in tqdm(range(list_length), desc=f"{method_name}", disable=not self.strategy.is_rank_0()):
+            # Create kwargs for single item
+            sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
+
+            result = func(**sample_kwargs)
+            results.append(result)
+
+        return results
+
 
 @ray.remote(num_gpus=1)
 class ReferenceModelRayActor(BasePPORole):
@@ -74,6 +112,8 @@ class ReferenceModelRayActor(BasePPORole):
             load_in_4bit=strategy.args.load_in_4bit,
             ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
             packing_samples=strategy.args.packing_samples,
+            temperature=strategy.args.temperature,
+            use_liger_kernel=strategy.args.use_liger_kernel,
         )
         strategy.print(model)
 
@@ -83,40 +123,45 @@ class ReferenceModelRayActor(BasePPORole):
         self.model = self.strategy.prepare(model, is_rlhf=True)
         self.model.eval()
 
-        self.param_dict = {}
-        for (name, param) in self.model.named_parameters():
-            self.param_dict[name] = param
-
     def forward(
         self,
         sequences: torch.LongTensor,
-        num_actions: int = None,
+        action_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
-        logps_allgather=False,
         packed_seq_lens: Optional[list[int]] = None,
+        return_logits=False,
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            log_probs = self.model(
-                sequences.to(device),
-                num_actions,
-                attention_mask.to(device),
-                return_output=return_output,
-                ring_attn_group=self.strategy.ring_attn_group,
-                logps_allgather=logps_allgather,
-                packed_seq_lens=packed_seq_lens,
-            )
-        return log_probs.to("cpu")
-
-    def empty_cache(self) -> None:
-        torch.cuda.empty_cache()
-
-    def ema_update(self, param_name, param_data, beta=0.992):
-        if param_name in self.param_dict:
-            param_initial = self.param_dict[param_name]
-            with deepspeed.zero.GatheredParameters([param_initial], enabled=self.strategy.args.zero_stage == 3):
-                param_initial.data.copy_((1 - beta) * param_data + beta * param_initial.data)
+            if not return_logits:
+                log_probs = self.model(
+                    sequences.to(device),
+                    action_mask.to(device),
+                    attention_mask.to(device),
+                    ring_attn_group=self.strategy.ring_attn_group,
+                    packed_seq_lens=packed_seq_lens,
+                )
+            else:
+                actor_output_dict = self.model(
+                    sequences.to(device),
+                    action_mask.to(device),
+                    attention_mask.to(device),
+                    ring_attn_group=self.strategy.ring_attn_group,
+                    return_logits=True,
+                )
+        if not return_logits:
+            return {
+                'action_log_probs': log_probs.to("cpu")
+            }
+        else:
+            action_logits = actor_output_dict['action_logits']
+            self_certainty = torch.logsumexp(action_logits, dim=-1) - action_logits.mean(dim=-1)
+            return {
+                'action_log_probs': actor_output_dict['action_log_probs'].to("cpu"),
+                'self_certainty': self_certainty.squeeze(dim=-1).to("cpu"),
+                'entropy': actor_output_dict['entropy'].to("cpu")
+            }
 
 
 @ray.remote(num_gpus=1)
@@ -145,15 +190,22 @@ class RewardModelRayActor(BasePPORole):
         self.model.eval()
 
     def forward(
-        self, sequences: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None, packed_seq_lens=None, pad_sequence=False
+        self,
+        sequences: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_lens=None,
+        pad_sequence=False,
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            reward = self.model(sequences.to(device), attention_mask.to(device), ring_attn_group=self.strategy.ring_attn_group, pad_sequence=True, packed_seq_lens=packed_seq_lens)
+            reward = self.model(
+                sequences.to(device),
+                attention_mask.to(device),
+                ring_attn_group=self.strategy.ring_attn_group,
+                pad_sequence=True,
+                packed_seq_lens=packed_seq_lens,
+            )
         return reward.to("cpu")
-
-    def empty_cache(self) -> None:
-        torch.cuda.empty_cache()
 
 
 class PPORayActorGroup:
@@ -178,12 +230,15 @@ class PPORayActorGroup:
         ray_actor_type: Type[BasePPORole],
         pg: PlacementGroup = None,
         num_gpus_per_actor=1,
+        duplicate_actors: int = 1,
         resources: Dict[str, float] = None,
         num_resources_per_node: int = None,
     ) -> None:
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
         self.ray_actor_type = ray_actor_type
+        # duplicate actors is ring_attn_size * tensor_parallel_size
+        self.duplicate_actors = duplicate_actors
 
         # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         self._resources = resources
@@ -255,65 +310,6 @@ class PPORayActorGroup:
         """
         return [actor.init_model_from_pretrained.remote(*args, **kwargs) for actor in self._actor_handlers]
 
-    def async_fit_actor_model(
-        self,
-        critic_model_group: "PPORayActorGroup",
-        initial_model_group: "PPORayActorGroup",
-        reward_model_groups: List["PPORayActorGroup"],
-        remote_rm_urls: List[str] = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        vllm_engines: List = None,
-    ):
-        """Train actor model.
-
-        Args:
-            critic_model_group (PPORayActorGroup): critic model group.
-            initial_model_group (PPORayActorGroup): reference model group.
-            reward_model_groups (PPORayActorGroup): reward model groups.
-            remote_rm_urls: remote RM APIs.
-            reward_fn: reward calculate function, must be specified if using multiple reward models.
-            vllm_engines: vllm engines for text generation, if not specified, generate text by actor model directly.
-
-        Returns:
-            List: list of remote object refs.
-        """
-        assert (
-            (remote_rm_urls and len(remote_rm_urls) == 1)
-            or (reward_model_groups and len(reward_model_groups) == 1)
-            or reward_fn is not None
-        ), "reward_fn must be specified if using multiple reward models"
-
-        critic_actors = critic_model_group._actor_handlers if critic_model_group else None
-        initial_actors = initial_model_group._actor_handlers if initial_model_group else None
-
-        refs = []
-        # TODO(wuxibin): actor model choose critic/reward/initial model in a
-        # round robin fashion, implement more efficient dispatching strategy.
-        for i, actor in enumerate(self._actor_handlers):
-            critic_actor = critic_actors[i % len(critic_actors)] if critic_actors else None
-            initial_actor = initial_actors[i % len(initial_actors)] if initial_actors else None
-
-            reward_actors = []
-            if not remote_rm_urls:
-                for reward_model_group in reward_model_groups:
-                    actors = reward_model_group._actor_handlers
-                    reward_actors.append(actors[i % len(actors)])
-
-            refs.append(
-                actor.fit.remote(
-                    critic_model=critic_actor,
-                    initial_model=initial_actor,
-                    reward_model=reward_actors,
-                    remote_rm_url=remote_rm_urls,
-                    reward_fn=reward_fn,
-                    vllm_engines=vllm_engines,
-                    # whether this actor should triger corresponding critic model training
-                    critic_train_remote=(i < len(critic_actors)) if critic_actor else None,
-                )
-            )
-
-        return refs
-
     def async_save_model(self):
         """Save actor model on rank 0.
 
@@ -327,4 +323,56 @@ class PPORayActorGroup:
         for actor in self._actor_handlers:
             method = getattr(actor, method_name)
             refs.append(method.remote(*args, **kwargs))
+        return refs
+
+    def async_run_method_batch(self, method_name, **kwargs):
+        """Run method on all actors with batched input data asynchronously using round-robin scheduling.
+        Each actor processes one chunk of data at a time. Actors in the same ring / tensor parallel group process the same chunk.
+
+        Args:
+            method_name (str): Name of the method to run
+            **kwargs: Keyword arguments for the method. Each value should be a list/tensor of the same length.
+
+        Returns:
+            List[ray.ObjectRef]: List of remote object references to the results
+        """
+        # Check if all kwargs parameters are iterable
+        for key, value in kwargs.items():
+            if not hasattr(value, "__len__"):
+                raise ValueError(f"Parameter {key} must be iterable")
+
+        # Get the length of the first parameter as reference
+        first_param = next(iter(kwargs.values()))
+        total_length = len(first_param)
+
+        # Verify all parameters have the same length
+        for key, value in kwargs.items():
+            if len(value) != total_length:
+                raise ValueError(
+                    f"All parameters must have the same length. {key} has length {len(value)}, expected {total_length}"
+                )
+
+        # Calculate chunk size based on number of effective actors (considering ring groups)
+        num_actors = len(self._actor_handlers)
+        effective_actors = num_actors // self.duplicate_actors
+        chunk_size = total_length // effective_actors
+        assert (
+            total_length >= effective_actors
+        ), f"Total length {total_length} must be greater than or equal to effective actors {effective_actors}"
+        if total_length % effective_actors != 0:
+            chunk_size += 1
+
+        all_data_ref = ray.put(kwargs)
+
+        refs = []
+        for chunk_idx in range(effective_actors):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, total_length)
+
+            for j in range(self.duplicate_actors):
+                actor_idx = chunk_idx * self.duplicate_actors + j
+                actor = self._actor_handlers[actor_idx]
+
+                refs.append(actor.execute_batch.remote(method_name, all_data_ref, start_idx, end_idx))
+
         return refs

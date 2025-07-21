@@ -32,6 +32,8 @@ def extract_code_deepseek(text):
     code = "\n".join(code) + "\n" + blocks[-1]
     return code.strip()
 
+from functools import lru_cache
+@lru_cache
 def has_code(text):
     try:
         # 尝试猜测文本的语言类型

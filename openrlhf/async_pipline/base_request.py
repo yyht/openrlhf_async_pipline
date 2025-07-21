@@ -10,6 +10,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional, Any, List, Dict, Tuple
 import aiohttp
+import aiohttp
+from aiohttp import ClientTimeout
 import os, sys
 from openrlhf.async_pipline.show_timer import Timer
 
@@ -37,37 +39,43 @@ async def process_single_request(url, headers, idx, request, **kwargs):
 
 async def process_single_request_server(url, headers, idx, request, **kwargs):
     """处理单个请求（含重试逻辑和信号量控制）"""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with Timer("##ASYNC-ROLLOUT-PROCESS##"):
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with asyncio.Semaphore(MAX_CONCURRENT):  # 信号量控制并发
+    connector = aiohttp.TCPConnector(
+        keepalive_timeout=30,  # 空闲连接保持时间(秒)
+        limit=100              # 总连接池大小
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=None) as session:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                # async with asyncio.Semaphore(MAX_CONCURRENT):  # 信号量控制并发
+                    async with Timer("##ASYNC-ROLLOUT-PROCESS##"):
                         # 构造请求负载
                         payload = request.to_json()
                         # 发送请求
-                        response = await client.post(
+                        response = await session.post(
                             url,
                             headers=headers,
                             json=payload,
                             timeout=REQUEST_TIMEOUT
                         )
                         response.raise_for_status()
-                        data = response.json()
+                        data = await response.json()
                         return (idx, data)
-        except Exception as e:
-            logger.warning(f"[{idx}] Attempt {attempt} failed: {e}")
-            if attempt == MAX_RETRIES:
-                logger.error(f"[{idx}] Failed after {MAX_RETRIES} attempts.")
-                return (idx, None)
-            await asyncio.sleep(attempt * 1.2)  # 指数退避
+            except Exception as e:
+                logger.warning(f"[{idx}] Attempt {attempt} failed: {e}")
+                if attempt == MAX_RETRIES:
+                    logger.error(f"[{idx}] Failed after {MAX_RETRIES} attempts.")
+                    return (idx, None)
+                await asyncio.sleep(attempt * 1.2)  # 指数退避
     return (idx, None)
 
 async def process_single_request_model(model, headers, idx, request, **kwargs):
     """处理单个请求（含重试逻辑和信号量控制）"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with Timer("##ASYNC-ROLLOUT-PROCESS##"):
-                async with asyncio.Semaphore(MAX_CONCURRENT):  # 信号量控制并发
+            # async with asyncio.Semaphore(MAX_CONCURRENT):  # 信号量控制并发
+                async with Timer("##ASYNC-ROLLOUT-PROCESS##"):
                     # 构造请求负载
                     # 发送请求
                     response = await model(request)

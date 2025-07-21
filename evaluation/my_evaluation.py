@@ -31,19 +31,15 @@ import os, sys, uuid
 
 ENV_ITER_NUM = int(os.getenv('ENV_ITER_NUM', '2'))
 VLLM_VERSION = os.getenv('VLLM_VERSION', 'vllm_083')
+USE_ID = os.getenv('USE_ID', 'NONE')
 
-# sys.path.append(os.getenv('OPENRLHF_PATH', '/cpfs/user/chenhao/debug/OpenRLHF_082'))
-sys.path.append(os.getenv('OPENRLHF_PATH', 'your-openrlhf-path'))
-from env.math.math_tir import math_tir_generate
+sys.path.append(os.getenv('OPENRLHF_PATH', 'your_openrlhf_path'))
+# from env.math.math_tir import math_tir_generate
+from env.math.math_tir_process_single_request import math_tir_generate_async
+from openrlhf.async_pipline.process_request import GenerateRequest, default_generate, process_batch_requests
 from passk_eval import estimate_pass_at_k
 from tabulate import tabulate
-
-# XVERIFY_MATH_MODEL_SERVER = os.environ.get('XVERIFY_MATH_MODEL_SERVER', None)
-# if XVERIFY_MATH_MODEL_SERVER:
-#     client = openai.Client(
-#                 base_url=f"{XVERIFY_MATH_MODEL_SERVER}/v1", 
-#                 api_key="EMPTY")
-
+import uuid
 
 import asyncio
 class AsyncLLM(object):
@@ -59,45 +55,148 @@ class AsyncLLM(object):
             dtype="bfloat16",
             disable_log_requests=True,
             seed=args.seed)
-        self.async_llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
+        self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
+        self.semaphore = asyncio.Semaphore(32)  # 实例级共享
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        self.args = args
+        self.batch_size = 32
         
-    async def generate_async(self, prompt, sampling_params, request_id):
+    def shutdown(self):
+        self.llm.shutdown()  # 释放 GPU 内存
+        
+    async def generate_async_server(self, request: GenerateRequest, sampling_params, request_id):
         # Send the request to the LLM engine.
-        import asyncio
-        async with asyncio.Semaphore(1):
-            stream = self.async_llm.generate(
-                request_id=str(request_id),
-                prompt=prompt,
-                sampling_params=sampling_params,
-            )
+        from vllm.inputs import TokensPrompt
+        async with self.semaphore:  # 使用共享信号量
+        # async with asyncio.Semaphore(MAX_CONCURRENT):  # 实例级共享
+            # stream = self.llm.generate(
+            #     request_id=str(request_id),
+            #     prompt=request.prompts[0],
+            #     sampling_params=sampling_params,
+            # )
+            
+            if USE_ID == 'USE_ID':
+                stream = self.llm.generate(
+                    request_id=str(request_id),
+                    prompt=TokensPrompt(prompt_token_ids=request.prompt_token_ids),
+                    # prompt=request.prompts[0],
+                    sampling_params=sampling_params,
+                )
+                
+            else:
+                stream = self.llm.generate(
+                    request_id=str(request_id),
+                    # prompt=TokensPrompt(prompt_token_ids=request.prompt_token_ids),
+                    prompt=request.prompts[0],
+                    sampling_params=sampling_params,
+                )
 
             # Consume the stream until the request is finished.
+            # 移入循环内部确保作用域隔离
+            final_output = None
             async for request_output in stream:
                 final_output = request_output
-            return final_output, request_id
-        
-    async def batch_generate(self, prompts, sampling_params):
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
-        tasks = []
-        for idx, (prompt, sampling_param) in enumerate(zip(prompts, sampling_params)):
-            request_id = str(uuid.uuid4()) + f'####idx:{idx}'
-            task = self.generate_async(prompt, sampling_param, request_id)
-            tasks.append(task)
+            if final_output is None:
+                raise RuntimeError(f"Empty stream for request_id: {request_id}")
             
-        import random
-        random.shuffle(tasks)
-            
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-        return task_results
+            assert final_output.request_id == request_id
+            output = [{
+                'outputs':[
+                    {
+                        "text": final_output.outputs[0].text,
+                        "token_ids": final_output.outputs[0].token_ids,
+                        "stop_reason": final_output.outputs[0].stop_reason,
+                        "finish_reason": final_output.outputs[0].finish_reason,
+                    }
+                ],
+                "prompt_token_ids": final_output.prompt_token_ids,
+                "request_id": final_output.request_id
+            }]
+            return output
+
+    async def async_llm_generate(self, request: GenerateRequest):
+        # 实际生成逻辑
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            n=request.n,
+            repetition_penalty=1.0,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            max_tokens=request.max_tokens,
+            include_stop_str_in_output=request.include_stop_str_in_output,
+            stop=request.stop,
+            skip_special_tokens=False
+        )
+
+        # request_id = str(uuid.uuid4())+request.uuids
+        request_id = f"{time.time_ns()}-{uuid.uuid4()}"
+        response = await self.generate_async_server(request, sampling_params, request_id)
+        return response
+    
+    def build_requests(self, prompts, uuids, sampling_params, infer_type='math_tir_async'):
+        request_list = []
+        for idx, (prompt, uuid_str) in enumerate(zip(prompts, uuids)):
+            request = GenerateRequest(
+                prompts=[prompt],
+                prompt_token_ids=self.tokenizer(prompt)['input_ids'],
+                max_tokens=sampling_params.max_tokens,
+                temperature=sampling_params.temperature,
+                stop=sampling_params.stop,
+                uuids=uuid_str+f'####idx:{idx}',
+                env_func=infer_type,
+                label=json.dumps({}, ensure_ascii=False),
+                request_rank=0,
+                max_length=sampling_params.max_tokens+1024
+            )
+            request_list.append(request)
+        print(len(request_list), '==request_list==')
+        return request_list
+    
+    def _create_batches(self, data_list):
+        """将数据分成 batch，返回 [(start_idx, batch), ...]"""
+        batches = []
+        if isinstance(data_list, list):
+            for i in range(0, len(data_list), self.batch_size):
+                batch = data_list[i:i + self.batch_size]
+                batches.append((i, batch))
+            if i + self.batch_size < len(data_list) - 1:
+                batches.append((i+1, data_list[i + self.batch_size:]))
+        elif isinstance(data_list, dict):
+            for env_func in data_list:
+                for i in range(0, len(data_list[env_func]), self.batch_size):
+                    batch = data_list[env_func][i:i + self.batch_size]
+                    batches.append((i, batch))
+                if i + self.batch_size < len(data_list[env_func]) - 1:
+                    batches.append((i+1, data_list[env_func][i + self.batch_size:]))
+        else:
+            raise ValueError("data_list must be a list or dict")
+        return batches
         
-    def generate(self, prompts, sampling_params):
-        task_results = asyncio.run(self.batch_generate(prompts, sampling_params))
-        task_results.sort(key=lambda item: int(item[1].split('####idx:')[-1]))
-        outputs = []
-        for task_result in task_results:
-            outputs.append(task_result[0])
-        return outputs
+    async def batch_generate(self, prompts, uuids, sampling_params):
+        request_list = self.build_requests(prompts, uuids, sampling_params)
+        batches = self._create_batches(request_list)
+        response_tasks = []
+        for start_idx, batch in batches:
+            env_func = batch[0].env_func
+            response_tasks.append(process_batch_requests(self.async_llm_generate, start_idx, batch, env_func=env_func, tokenizer=self.tokenizer, use_reward=False))
+
+        results_raw = await asyncio.gather(*response_tasks)
+            
+        flat_results = []
+        for result_raw in results_raw:
+            successful_results, failed_results = result_raw
+            for item in successful_results:
+                flat_results.append(item)
+        responses = [result[1][1] for result in flat_results]
+        responses.sort(key=lambda x: int(x.request_id.split('####idx:')[-1]))
+        return responses
+        
+    def generate(self, prompts, uuids, sampling_params):
+        responses = asyncio.run(self.batch_generate(prompts, uuids, sampling_params))
+        return responses
     
     
 
@@ -172,30 +271,22 @@ def evaluation(args, data_name, llm, tokenizer):
         idx for (idx, prompt) in enumerate(input_prompts) for _ in range(args.n_sampling)
     ]
     
+    uuids = []
+    for (idx, prompt) in enumerate(input_prompts):
+        for _ in range(args.n_sampling):
+            uuid_str = str(uuid.uuid4())
+            uuids.append(uuid_str)
     
     if args.use_vllm:
-        if args.use_seperate:
-            outputs = []
-            for prompt in prompts:
-                output = llm.generate(
-                        [prompt],
-                        sampling_params
-                    )
-                outputs.append(output[0])
-        else:
-            outputs = llm.generate(
-                        prompts,
-                        sampling_params
-                    )
-    elif args.use_vllm_tir:
-        if args.use_seperate:
-            outputs = []
-            for prompt in prompts:
-                output = math_tir_generate(llm, sampling_params, None, tokenizer, prompts=[prompt])
-                outputs.append(output[0])
-            # outputs = math_tir_generate(llm, sampling_params, None, tokenizer, prompts=prompts)
-        else:
-            outputs = math_tir_generate(llm, sampling_params, None, tokenizer, prompts=prompts)
+        outputs = llm.generate(
+                    prompts,
+                    sampling_params
+                )
+    # elif args.use_vllm_tir:
+    #     outputs = math_tir_generate(llm, sampling_params, None, tokenizer, prompts=prompts)
+        
+    if args.use_vllm_tir and args.use_seperate:
+        outputs = llm.generate(prompts, uuids, sampling_params)
     
     assert len(outputs) == len(prompts)
     
@@ -348,7 +439,8 @@ def evaluation_main(args):
     print(available_gpus, '==available_gpus==')
     
     if args.use_seperate:
-        llm = AsyncLLM(args)
+        print('==using async-llm==')
+        llm = None
     else:
         llm = LLM(
             model=args.model_name_or_path,
@@ -368,6 +460,11 @@ def evaluation_main(args):
     score_dict = OrderedDict()
     for data_name in args.data_names.split(','):
         score_dict[data_name] = {}
+        if args.use_seperate:
+            if llm is not None:
+                llm.shutdown()
+                del llm
+            llm = AsyncLLM(args)
         data_list, out_file, pass_at_k = evaluation(args, data_name, llm, tokenizer)
         if args.n_sampling == 1:
             data_score = sum([d['pred_score'][0] for d in data_list])

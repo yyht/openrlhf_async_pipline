@@ -10,6 +10,9 @@ def get_train_ds_config(
     zpg=8,
     grad_accum_dtype=None,
     overlap_comm=False,
+    use_ds_universal_ckpt=False,
+    deepcompile=False,
+    tensor_parallel_size=1,
 ):
     device = "cpu" if offload else "none"
     zero_opt_dict = {
@@ -33,6 +36,8 @@ def get_train_ds_config(
     if overlap_comm:
         zero_opt_dict["overlap_comm"] = True
         zero_opt_dict["contiguous_gradients"] = True
+    if stage == 3:
+        zero_opt_dict["reduce_scatter"] = True
 
     return {
         "steps_per_print": 100,
@@ -44,6 +49,15 @@ def get_train_ds_config(
         "prescale_gradients": False,
         "wall_clock_breakdown": False,
         "data_types": {"grad_accum_dtype": grad_accum_dtype},
+        "checkpoint": {
+            "load_universal": use_ds_universal_ckpt,
+        },
+        "compile": {
+            "deepcompile": deepcompile,
+        },
+        "tensor_parallel": {
+            "autotp_size": tensor_parallel_size,
+        },
     }
 
 
@@ -51,10 +65,19 @@ def get_eval_ds_config(
     offload,
     stage=0,
     bf16=True,
+    deepcompile=False,
+    tensor_parallel_size=1,
 ):
+    # At least for 0.16.6, DeepCompile hasn't support pure inference mode
+    # https://github.com/deepspeedai/DeepSpeed/pull/7225
+    deepcompile = False
+
     zero_opt_dict = {
         "stage": stage,
+        "stage3_max_live_parameters": "auto",
+        "stage3_max_reuse_distance": "auto",
         "stage3_param_persistence_threshold": "auto",
+        "stage3_prefetch_bucket_size": "auto",
         "offload_param": {
             "device": "cpu" if offload else "none",
             "pin_memory": True,
@@ -69,6 +92,12 @@ def get_eval_ds_config(
         "gradient_clipping": 1.0,
         "prescale_gradients": False,
         "wall_clock_breakdown": False,
+        "compile": {
+            "deepcompile": deepcompile,
+        },
+        "tensor_parallel": {
+            "autotp_size": tensor_parallel_size,
+        },
     }
 
 
@@ -114,17 +143,25 @@ def offload_deepspeed_states(model, pin_memory=True, non_blocking=True):
         raise NotImplementedError("Only Zero stage 3 is currently supported")
 
     # if zero_stage == 3 and not adam_offload:
+    import deepspeed
     import torch
     from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 
+    offload_state_types = [
+        OffloadStateTypeEnum.optim_states,
+        OffloadStateTypeEnum.contiguous_grad_buffer,
+        OffloadStateTypeEnum.hp_params,
+    ]
+
+    if deepspeed.__version__ >= "0.16.5":
+        # These offload types are fixed in https://github.com/deepspeedai/DeepSpeed/pull/7050
+        offload_state_types += [
+            OffloadStateTypeEnum.lp_grads,
+            # OffloadStateTypeEnum.lp_params,
+        ]
+
     model.optimizer.offload_states(
-        include=[
-            OffloadStateTypeEnum.optim_states,
-            OffloadStateTypeEnum.contiguous_grad_buffer,
-            OffloadStateTypeEnum.hp_params,
-            # OffloadStateTypeEnum.lp_grads,
-            # OffloadStateTypeEnum.lp_params, # Not released yet, fixed in https://github.com/deepspeedai/DeepSpeed/pull/7050
-        ],
+        include=offload_state_types,
         device=OffloadDeviceEnum.cpu,
         pin_memory=pin_memory,
         non_blocking=non_blocking,

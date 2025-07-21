@@ -44,7 +44,9 @@ keyword_processor = KeywordProcessor()
 for key in KEYWORDS:
     for word in KEYWORDS[key]:
         keyword_processor.add_keyword(word, key)
-        
+
+from functools import lru_cache
+@lru_cache
 def pattern_count(response):
     results = keyword_processor.extract_keywords(response)
     my_counter = {

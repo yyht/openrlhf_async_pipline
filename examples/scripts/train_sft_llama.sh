@@ -20,6 +20,7 @@ openrlhf.cli.train_sft \
    --flash_attn \
    --learning_rate 5e-6 \
    --load_checkpoint \
+   --packing_samples \
    --gradient_checkpointing
 EOF
     # --wandb [WANDB_TOKENS]

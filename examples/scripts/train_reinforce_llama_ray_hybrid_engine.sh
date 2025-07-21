@@ -1,8 +1,6 @@
 set -x
 
-ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{"working_dir": "/openrlhf"}' \
-   -- python3 -m openrlhf.cli.train_ppo_ray \
+python3 -m openrlhf.cli.train_ppo_ray \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 8 \
    --reward_num_nodes 1 \
@@ -19,9 +17,9 @@ ray job submit --address="http://127.0.0.1:8265" \
    --save_path /openrlhf/examples/test_scripts/final/llama3-8b-rlhf \
    --ckpt_path /openrlhf/examples/test_scripts/ckpt/llama3-8b-rlhf \
    --save_hf_ckpt \
-   --micro_train_batch_size 4 \
+   --micro_train_batch_size 8 \
    --train_batch_size 128 \
-   --micro_rollout_batch_size 8 \
+   --micro_rollout_batch_size 16 \
    --rollout_batch_size 1024 \
    --n_samples_per_prompt 1 \
    --max_epochs 1 \

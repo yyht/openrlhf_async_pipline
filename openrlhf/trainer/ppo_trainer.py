@@ -1,186 +1,123 @@
 import os
-import os.path
+import time
 from abc import ABC
-from typing import Any, Callable, Dict, List, Optional
+from datetime import timedelta
 
+import ray
 import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.optim import Optimizer
-from torch.utils.data import DataLoader
 from tqdm import tqdm
+import random
 
-from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
-from openrlhf.models.utils import masked_mean, unpacking_samples, compute_approx_kl
-from openrlhf.models.ring_attn_utils import unpad_sequences, pad_sequences
-from openrlhf.utils.distributed_sampler import DistributedSampler
-
-from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
-from openrlhf.models.entropy_loss import EntropyLoss
-from openrlhf.models.dpg_loss import DPGLoss
-from torch import distributed as dist
+from openrlhf.datasets import PromptDataset
+from openrlhf.datasets.utils import blending_datasets
+from openrlhf.trainer.ppo_utils import AdaptiveKLController, FixedKLController
+from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
+from openrlhf.trainer.ray.launcher import PPORayActorGroup
+from openrlhf.utils import get_tokenizer
+from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
-import threading
+from openrlhf.trainer.ppo_utils.experience_maker import split_experience_batch
+from openrlhf.trainer.ppo_utils.seqlen_balancing import get_seqlen_balanced_partitions
+from openrlhf.trainer.ppo_utils.exp_balancing import balanced_subset
 
 logger = init_logger(__name__)
 
-class PPOTrainer(ABC):
-    """
-    Trainer for Proximal Policy Optimization (PPO) algorithm.
+def dump_samples(args, eposide, samples, prefix='rollout_sample_eposide'):
+    import os, json
+    output_path = os.path.join(args.save_path, f'{prefix}_{eposide}.jsonl')
+    logger.info(f'Dump samples to {output_path}')
+    with open(output_path, 'w') as fwobj:
+        for item in samples:
+            tmp = item.__dict__.copy()
+            for key in tmp:
+                if isinstance(tmp[key], torch.Tensor):
+                    tmp[key] = tmp[key].numpy().tolist()
+            fwobj.write(json.dumps(tmp, ensure_ascii=False)+'\n')
 
-    Args:
-        strategy (Strategy): The training strategy to use.
-        actor (Actor): The actor model in the PPO algorithm.
-        critic (nn.Module): The critic model in the PPO algorithm.
-        reward_model (nn.Module): The reward model for calculating rewards in the RLHF setup.
-        initial_model (Actor): The initial model for reference logits to limit actor updates in RLHF.
-        ema_model (Actor): The exponential moving average model for stable training.
-        actor_optim (Optimizer): The optimizer for the actor model.
-        critic_optim (Optimizer): The optimizer for the critic model.
-        actor_scheduler (Scheduler): The learning rate scheduler for the actor.
-        critic_scheduler (Scheduler): The learning rate scheduler for the critic.
-        ema_beta (float, defaults to 0.992): EMA decay rate for model stability.
-        init_kl_coef (float, defaults to 0.001): Initial coefficient for KL divergence.
-        kl_target (float, optional): Target value for KL divergence.
-        kl_horizon (int, defaults to 10000): Horizon for KL annealing.
-        ptx_coef (float, defaults to 0): Coefficient for supervised loss from pre-trained data.
-        micro_train_batch_size (int, defaults to 8): Micro-batch size for actor training.
-        buffer_limit (int, defaults to 0): Maximum size of the replay buffer.
-        buffer_cpu_offload (bool, defaults to True): If True, offloads replay buffer to CPU.
-        eps_clip (float, defaults to 0.2): Clipping coefficient for policy loss.
-        value_clip (float, defaults to 0.2): Clipping coefficient for value function loss.
-        micro_rollout_batch_size (int, defaults to 8): Micro-batch size for generating rollouts.
-        gradient_checkpointing (bool, defaults to False): If True, enables gradient checkpointing.
-        max_epochs (int, defaults to 1): Number of epochs to train.
-        max_norm (float, defaults to 1.0): Maximum gradient norm for gradient clipping.
-        tokenizer (Callable, optional): Tokenizer for input data.
-        prompt_max_len (int, defaults to 128): Maximum length for prompts.
-        dataloader_pin_memory (bool, defaults to True): If True, pins memory in the data loader.
-        remote_rm_url (str, optional): URL for remote reward model API.
-        reward_fn (Callable, optional): Custom reward function for computing rewards.
-        save_hf_ckpt (bool): Whether to save huggingface-format model weight.
-        disable_ds_ckpt (bool): Whether not to save deepspeed-format model weight. (Deepspeed model weight is used for training recovery)
-        **generate_kwargs: Additional arguments for model generation.
-    """
+def experience_statistics(experiences, exp_num):
+    rewards_seq = [experience.info['answer_rewards'].item() for experience in experiences]
+    selected_indices, remaining_indices = balanced_subset(rewards_seq, exp_num)
+    selected_experiences = [experiences[indice] for indice in selected_indices]
+    remaining_experiences = [experiences[indice] for indice in remaining_indices]
+    return selected_experiences, remaining_experiences
 
+
+class BasePPOTrainer(ABC):
     def __init__(
         self,
-        strategy,
-        actor: Actor,
-        critic: nn.Module,
-        reward_model: nn.Module,
-        initial_model: Actor,
-        ema_model: Actor,
-        actor_optim: Optimizer,
-        critic_optim: Optimizer,
-        actor_scheduler,
-        critic_scheduler,
-        ema_beta: float = 0.992,
-        init_kl_coef: float = 0.001,
-        kl_target: float = None,
-        kl_horizon: int = 10000,
-        ptx_coef: float = 0,
-        micro_train_batch_size: int = 8,
-        buffer_limit: int = 0,
-        buffer_cpu_offload: bool = True,
-        eps_clip: float = 0.2,
-        value_clip: float = 0.2,
-        micro_rollout_batch_size: int = 8,
-        gradient_checkpointing: bool = False,
-        max_epochs: int = 1,
-        max_norm: float = 1.0,
-        tokenizer: Optional[Callable[[Any], dict]] = None,
-        prompt_max_len: int = 128,
+        pretrain: str,
+        strategy: DeepspeedStrategy,
+        actor_model_group: PPORayActorGroup,
+        critic_model_group: PPORayActorGroup,
+        reward_model_group: PPORayActorGroup,
+        reference_model_group: PPORayActorGroup,
+        vllm_engines=None,
+        prompt_max_len: int = 120,
         dataloader_pin_memory: bool = True,
-        remote_rm_url: str = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        save_hf_ckpt: bool = False,
-        disable_ds_ckpt: bool = False,
+        prompt_split: str = "train",
+        eval_split: str = "test",
         **generate_kwargs,
     ) -> None:
-        assert (
-            not isinstance(reward_model, List) or len(reward_model) == 1 or reward_fn is not None
-        ), "reward_fn must be specified if using multiple reward models"
-
         super().__init__()
+
         self.strategy = strategy
         self.args = strategy.args
-        self.save_hf_ckpt = save_hf_ckpt
-        self.disable_ds_ckpt = disable_ds_ckpt
-        self.micro_rollout_batch_size = micro_rollout_batch_size
-        self.max_epochs = max_epochs
-        self.tokenizer = tokenizer
-        self.generate_kwargs = generate_kwargs
+
+        self.tokenizer = get_tokenizer(pretrain, None, "left", strategy, use_fast=not self.args.disable_fast_tokenizer)
+        self.actor_model_group = actor_model_group
+        self.critic_model_group = critic_model_group
+        self.reward_model_group = reward_model_group
+        self.reference_model_group = reference_model_group
         self.dataloader_pin_memory = dataloader_pin_memory
-        self.max_norm = max_norm
-        self.ptx_coef = ptx_coef
-        self.micro_train_batch_size = micro_train_batch_size
-        self.kl_target = kl_target
+        self.vllm_engines = vllm_engines
+
+        self.prompt_split = prompt_split
+        self.eval_split = eval_split
+
         self.prompt_max_len = prompt_max_len
-        self.ema_beta = ema_beta
-        self.gradient_checkpointing = gradient_checkpointing
-        self.reward_fn = reward_fn
+        self.generate_kwargs = generate_kwargs
 
-        self.actor = actor
-        self.critic = critic
-        self.reward_model = reward_model
-        self.remote_rm_url = remote_rm_url
-        self.initial_model = initial_model
-        self.ema_model = ema_model
-        self.actor_optim = actor_optim
-        self.critic_optim = critic_optim
-        self.actor_scheduler = actor_scheduler
-        self.critic_scheduler = critic_scheduler
-
-        self.actor_loss_fn = PolicyLoss(eps_clip, self.strategy.args.eps_clip_high)
-        self.critic_loss_fn = ValueLoss(value_clip, self.strategy.args.value_clip_high)
-        self.ptx_loss_fn = GPTLMLoss()
-
-        self.entropy_loss_fn = EntropyLoss()
-        self.dpg_loss_fn = DPGLoss(eps_clip)
+        self.max_epochs = self.args.max_epochs
+        self.remote_rm_url = self.args.remote_rm_url
+        self.init_kl_coef = self.args.init_kl_coef
+        self.kl_target = self.args.kl_target
+        self.kl_horizon = self.args.kl_horizon
 
         self.freezing_actor_steps = getattr(self.args, "freezing_actor_steps", -1)
 
-        # Mixtral 8x7b
-        self.aux_loss = self.args.aux_loss_coef > 1e-8
+        # Init dummy variables
+        self.prompts_dataloader = None
+        self.eval_dataloader = None
+        self.max_steps = None
 
-        if self.kl_target:
-            self.kl_ctl = AdaptiveKLController(init_kl_coef, kl_target, kl_horizon)
+        self.samples_generator = None
+        self.experience_maker = None
+        self.remote_reward_model = None
+
+        if self.args.agent_func_path:
+            from openrlhf.trainer.ppo_utils.experience_maker_async import SamplesGeneratorAsync as SamplesGenerator
         else:
-            self.kl_ctl = FixedKLController(init_kl_coef)
+            from openrlhf.trainer.ppo_utils.experience_maker import SamplesGenerator
 
-        self.experience_maker = NaiveExperienceMaker(
-            actor,
-            critic,
-            reward_model,
-            initial_model,
-            tokenizer,
-            prompt_max_len,
-            self.kl_ctl,
-            strategy,
-            remote_rm_url,
-            reward_fn,
-        )
-        packing_samples = getattr(self.args, "packing_samples", False)
-        self.replay_buffer = NaiveReplayBuffer(
-            self.strategy, micro_train_batch_size, buffer_limit, buffer_cpu_offload, packing_samples
-        )
+        self.generator_cls = SamplesGenerator
 
+    def _init_wandb(self):
         # wandb/tensorboard setting
         self._wandb = None
         self._tensorboard = None
-        if self.strategy.args.use_wandb and self.strategy.is_rank_0():
+        self.generated_samples_table = None
+        if self.strategy.args.use_wandb:
             import wandb
 
             self._wandb = wandb
             if not wandb.api.api_key:
-                wandb.login(key=strategy.args.use_wandb)
+                wandb.login(key=self.strategy.args.use_wandb)
             wandb.init(
-                entity=strategy.args.wandb_org,
-                project=strategy.args.wandb_project,
-                group=strategy.args.wandb_group,
-                name=strategy.args.wandb_run_name,
-                config=strategy.args.__dict__,
+                entity=self.strategy.args.wandb_org,
+                project=self.strategy.args.wandb_project,
+                group=self.strategy.args.wandb_group,
+                name=self.strategy.args.wandb_run_name,
+                config=self.strategy.args.__dict__,
                 reinit=True,
             )
 
@@ -188,698 +125,80 @@ class PPOTrainer(ABC):
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            self.generated_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
-        if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
+        if self.strategy.args.use_tensorboard and self._wandb is None:
             from torch.utils.tensorboard import SummaryWriter
 
             os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
-            log_dir = os.path.join(self.strategy.args.use_tensorboard, strategy.args.wandb_run_name)
+            log_dir = os.path.join(self.strategy.args.use_tensorboard, self.strategy.args.wandb_run_name)
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
-    def fit_sync(
-        self,
-        args,
-        prompts_dataloader,
-        pretrain_dataloader,
-        consumed_samples=0,
-        num_update_steps_per_episodes=1,
-    ) -> None:
-        num_rollouts_per_episodes = (
-            num_update_steps_per_episodes
-            * args.train_batch_size
-            // args.max_epochs
-            // args.rollout_batch_size
-            // args.n_samples_per_prompt
-        )
+    def fit(self):
+        raise NotImplementedError("fit method is not implemented")
 
-        # get eval and save steps
-        if args.eval_steps == -1:
-            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
-        if args.save_steps == -1:
-            args.save_steps = float("inf")  # do not save ckpt
-
-        self.prompts_dataloader = prompts_dataloader
-        self.pretrain_dataloader = pretrain_dataloader
-
-        # Restore step and start_epoch
-        steps = consumed_samples // args.rollout_batch_size + 1
-        start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
-        consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
-        for episode in range(start_episode, args.num_episodes):
-            if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
-                self.prompts_dataloader.sampler.set_epoch(
-                    episode, consumed_samples=0 if episode > start_episode else consumed_samples
-                )
-            pbar = tqdm(
-                range(self.prompts_dataloader.__len__()),
-                desc=f"Episode [{episode + 1}/{args.num_episodes}]",
-                disable=not self.strategy.is_rank_0(),
-            )
-
-            for rand_prompts, labels in self.prompts_dataloader:
-
-                logger.info({
-                    'INFO': '##INPUT_LABEL##',
-                    'rand_prompts': len(rand_prompts),
-                    'labels': len(labels)
-                })
-                
-                for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, labels, all_rollouts=None, **self.generate_kwargs)
-                ):
-                    if i == 0:
-                        output = self.tokenizer.batch_decode(
-                            experience.sequences[0].unsqueeze(0), skip_special_tokens=True
-                        )
-                        self.strategy.print(output)
-                    self.replay_buffer.append(experience)
-
-                # acc-filter or global_shuffle
-                if steps > self.strategy.args.freezing_actor_steps:
-                    if self.strategy.args.use_acc_filter or self.strategy.args.global_shuffle:
-                        self.replay_buffer.all_gather(steps=steps)
-                        if len(self.replay_buffer) % self.args.train_batch_size != 0:
-                            self.replay_buffer.clear()
-                            torch.distributed.barrier()
-                            continue
-
-                # if self.args.advantage_estimator != "group_norm":
-                if not self.args.use_critic_advantage_normalize:
-                    if self.args.advantage_estimator not in ["group_norm", "control_variate", "control_variate_f_div"]:
-                        if self.args.normalize_mean:
-                            self.replay_buffer.normalize_mean("advantages", self.strategy)
-                        self.replay_buffer.normalize("advantages", self.strategy)
-                
-                status = self.ppo_train(steps)
-                self.replay_buffer.clear()
-
-                if "kl" in status:
-                    self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
-                pbar.set_postfix(status)
-
-                # logs/checkpoints
-                client_states = {"consumed_samples": steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
-
-                pbar.update()
-                steps = steps + 1
-
-        if self._wandb is not None and self.strategy.is_rank_0():
-            self._wandb.finish()
-        if self._tensorboard is not None and self.strategy.is_rank_0():
-            self._tensorboard.close()
-
-    def fit(
-        self,
-        args,
-        prompts_dataloader,
-        pretrain_dataloader,
-        consumed_samples=0,
-        num_update_steps_per_episodes=1,
-    ) -> None:
-        num_rollouts_per_episodes = (
-            num_update_steps_per_episodes
-            * args.train_batch_size
-            // args.max_epochs
-            // args.rollout_batch_size
-            // args.n_samples_per_prompt
-        )
-
-        # get eval and save steps
-        if args.eval_steps == -1:
-            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
-        if args.save_steps == -1:
-            args.save_steps = float("inf")  # do not save ckpt
-
-        self.prompts_dataloader = prompts_dataloader
-        self.pretrain_dataloader = pretrain_dataloader
-
-        # Restore step and start_epoch
-        steps = consumed_samples // args.rollout_batch_size + 1
-        start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
-        consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
-        total_idx = 0
-        async_gatherd = None
-
-        for episode in range(start_episode, args.num_episodes):
-            if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
-                self.prompts_dataloader.sampler.set_epoch(
-                    episode, consumed_samples=0 if episode > start_episode else consumed_samples
-                )
-            pbar = tqdm(
-                range(self.prompts_dataloader.__len__()),
-                desc=f"Episode [{episode + 1}/{args.num_episodes}]",
-                disable=not self.strategy.is_rank_0(),
-            )
-
-            for prompt_idx, (rand_prompts, labels) in enumerate(self.prompts_dataloader):
-
-                logger.info({
-                    'INFO': '##INPUT_LABEL##',
-                    'rand_prompts': len(rand_prompts),
-                    'labels': len(labels)
-                })
-
-                if total_idx == 0:
-                    is_succeeded = self.experience_maker.run_sync_queue(rand_prompts, labels, prompt_idx, **self.generate_kwargs)
-                    torch.distributed.barrier()
-                    queue_size = self.experience_maker.get_queue_size()
-                    logger.info({
-                        'INFO': '##INITIAL-SYNC-GATHER-QUEUE-SIZE##',
-                        'QUEUE_SIZE': queue_size
-                    })
-                    total_idx += 1
-                    continue
-
-                queue_size = self.experience_maker.get_queue_size()
-                logger.info({
-                    'INFO': '##QUEUE-SIZE##',
-                    'QUEUE_SIZE': queue_size
-                })
-
-                if queue_size < 1:
-                    is_succeeded = self.experience_maker.run_sync_queue(rand_prompts, labels, prompt_idx, **self.generate_kwargs)
-                    torch.distributed.barrier()
-                    queue_size = self.experience_maker.get_queue_size()
-                    logger.info({
-                        'INFO': '##AFTER-SYNC-GATHER-QUEUE-SIZE##',
-                        'QUEUE_SIZE': queue_size
-                    })
-                    continue
-
-                all_prompts, all_labels, refs = self.experience_maker.run_async_queue(rand_prompts, labels, prompt_idx, **self.generate_kwargs)
-                async_gatherd = [all_prompts, all_labels, prompt_idx, refs]
-
-                batch = self.experience_maker.get_output_queue(1)
-                logger.info({
-                    'INFO': '##BATCH##',
-                    'batch_info': len(batch),
-                })
-
-                all_prompts, all_labels, all_rollouts = batch[0][0], batch[0][1], batch[0][2]
-                
-                logger.info({
-                    'INFO': '##BEGIN-EXP-MAKE##',
-                })
-
-                for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(all_prompts, all_labels, all_rollouts=all_rollouts, **self.generate_kwargs)
-                ):
-                    if i == 0:
-                        output = self.tokenizer.batch_decode(
-                            experience.sequences[0].unsqueeze(0), skip_special_tokens=True
-                        )
-                        self.strategy.print(output)
-                    self.replay_buffer.append(experience)
-
-                # acc-filter or global_shuffle
-                if steps > self.strategy.args.freezing_actor_steps:
-                    if self.strategy.args.use_acc_filter or self.strategy.args.global_shuffle:
-                        self.replay_buffer.all_gather(steps=steps)
-                        if len(self.replay_buffer) % self.args.train_batch_size != 0:
-                            self.replay_buffer.clear()
-                            if async_gatherd is not None:
-                                is_succeeded = self.experience_maker.gather_queue(async_gatherd[0], async_gatherd[1], async_gatherd[2], async_gatherd[3])
-                                async_gatherd = None
-                                queue_size = self.experience_maker.get_queue_size()
-                                logger.info({
-                                    'INFO': '##AFTER-MAKE-EXP-ASYNC-GATHER-QUEUE-SIZE##',
-                                    'QUEUE_SIZE': queue_size
-                                })
-                                torch.distributed.barrier()
-                            torch.distributed.barrier()
-                            continue
-
-                # if self.args.advantage_estimator != "group_norm":
-                if not self.args.use_critic_advantage_normalize:
-                    if self.args.advantage_estimator not in ["group_norm", "control_variate", "control_variate_f_div"]:
-                        if self.args.normalize_mean:
-                            self.replay_buffer.normalize_mean("advantages", self.strategy)
-                        self.replay_buffer.normalize("advantages", self.strategy)
-                
-                status = self.ppo_train(steps, async_gatherd=async_gatherd)
-                self.replay_buffer.clear()
-                async_gatherd = None
-
-                if "kl" in status:
-                    self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
-                pbar.set_postfix(status)
-
-                # logs/checkpoints
-                client_states = {"consumed_samples": steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
-
-                pbar.update()
-                steps = steps + 1
-
-
-        if self._wandb is not None and self.strategy.is_rank_0():
-            self._wandb.finish()
-        if self._tensorboard is not None and self.strategy.is_rank_0():
-            self._tensorboard.close()
-
-    def ppo_train(self, global_steps=0, **kwargs):
-        torch.cuda.empty_cache()
-        # replay buffer may be empty at first, we should rebuild at each training
-        if self.replay_buffer.gathered and (self.strategy.args.use_acc_filter or self.strategy.args.global_shuffle):
-            dataloader = self.strategy.setup_dataloader(
-                self.replay_buffer,
-                batch_size=self.replay_buffer.sample_batch_size,
-                pin_memory=self.dataloader_pin_memory,
-                shuffle=False if self.strategy.ring_attn_group is not None else True,
-                drop_last=True,
-                collate_fn=self.replay_buffer.collate_fn,
-            )
-        else:
-            dataloader = DataLoader(
-                self.replay_buffer,
-                batch_size=self.replay_buffer.sample_batch_size,
-                shuffle=False if self.strategy.ring_attn_group is not None else True,
-                drop_last=True,
-                pin_memory=self.dataloader_pin_memory,
-                collate_fn=self.replay_buffer.collate_fn,
-            )
-        device = torch.cuda.current_device()
-
-        status_list = []
-        status_mean = {}
-        for epoch in range(self.max_epochs):
-            pbar = tqdm(
-                dataloader,
-                desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
-                disable=not self.strategy.is_rank_0(),
-            )
-            
-            prefetch = []
-            for experience in pbar:
-                if self.strategy.args.use_prefetch:
-                    if len(prefetch) == 0 or len(prefetch) % self.strategy.accumulated_gradient != 0:
-                        prefetch.append(experience)
-                    if len(prefetch) % self.strategy.accumulated_gradient == 0:
-                        torch.distributed.barrier()
-                        length_status = {
-                            'response_length': prefetch[0].info['response_length'].sum()
-                        }
-                        if self.args.sft_loss_coef > 0:
-                            sft_response_length = prefetch[0].info['response_length'].float() * prefetch[0].info['acc_ratio'].float()
-                            length_status['sft_response_length'] = sft_response_length.sum()
-                        for exp in prefetch[1:]:
-                            length_status['response_length'] += exp.info['response_length'].float().sum()
-                            if self.args.sft_loss_coef > 0:
-                                sft_response_length = exp.info['response_length'].float() * exp.info['acc_ratio'].float()
-                                length_status['sft_response_length'] += sft_response_length.sum()
-                        length_status = self.strategy.all_reduce(length_status, op='sum')
-                        logger.info({
-                            'INFO': '##LENGTHSTATUS##',
-                            'VALUE': length_status,
-                            'PREFETCH': len(prefetch),
-                            'GRAD_ACCUMULATION': self.strategy.accumulated_gradient,
-                            'RANK': self.strategy.get_rank()
-                        })
-                        for (local_step, exp) in enumerate(prefetch):
-                            exp.to_device(device)
-                            status = self.training_step(exp, global_steps, length_status=length_status)
-                            # for DP
-                            # weighted mean for kl
-                            if "kl" in status:
-                                status["kl"] *= status["response_length"]
-                                status = self.strategy.all_reduce(status)
-                                status["kl"] /= status["response_length"]
-
-                            short_status = {}
-
-                            if "policy_loss" in status:
-                                short_status = {
-                                    "pg": status["policy_loss"],
-                                    "rm": status["reward"],
-                                    "ret": status["return"],
-                                    "glen": status["response_length"],
-                                    "tlen": status["total_length"],
-                                    "kl": status["kl"],
-                                    "act_lr": status["actor_lr"],
-                                }
-
-                            if "critic_loss" in status:
-                                short_status["cri"] = status["critic_loss"]
-                                short_status["vals"] = status["values"]
-                                short_status["cri_lr"] = status["critic_lr"]
-
-                            if "ptx_loss" in status:
-                                short_status["ptx"] = status["ptx_loss"]
-                            status_list.append(status)
-                            pbar.set_postfix(short_status)
-                        prefetch = []
-                else:
-                    experience.to_device(device)
-                    status = self.training_step(experience, global_steps)
-                    # for DP
-                    # weighted mean for kl
-                    if "kl" in status:
-                        status["kl"] *= status["response_length"]
-                        status = self.strategy.all_reduce(status)
-                        status["kl"] /= status["response_length"]
-
-                    short_status = {}
-
-                    if "policy_loss" in status:
-                        short_status = {
-                            "pg": status["policy_loss"],
-                            "rm": status["reward"],
-                            "ret": status["return"],
-                            "glen": status["response_length"],
-                            "tlen": status["total_length"],
-                            "kl": status["kl"],
-                            "act_lr": status["actor_lr"],
-                        }
-
-                    if "critic_loss" in status:
-                        short_status["cri"] = status["critic_loss"]
-                        short_status["vals"] = status["values"]
-                        short_status["cri_lr"] = status["critic_lr"]
-
-                    if "ptx_loss" in status:
-                        short_status["ptx"] = status["ptx_loss"]
-
-                    status_list.append(status)
-                    pbar.set_postfix(short_status)
-
-        if status_list:
-            status_mean = status_list[0]
-            for m in status_list[1:]:
-                for k, v in m.items():
-                    status_mean[k] += v
-            for k in status_mean.keys():
-                status_mean[k] /= len(status_list)
-        torch.cuda.empty_cache()
-        return status_mean
-
-    def training_step(self, experience: Experience, global_steps, length_status=None) -> Dict[str, float]:
+    def ppo_train(self, global_steps, global_response_length=None):
         status = {}
+
+        # triger remote critic model training
+        if self.critic_model_group is not None:
+            # sync for deepspeed_enable_sleep
+            if self.strategy.args.deepspeed_enable_sleep:
+                ray.get(self.critic_model_group.async_run_method(method_name="reload_states"))
+
+            critic_status_ref = self.critic_model_group.async_run_method(method_name="fit")
+
+            if self.strategy.args.colocate_all_models or self.strategy.args.deepspeed_enable_sleep:
+                status.update(ray.get(critic_status_ref)[0])
+            if self.strategy.args.deepspeed_enable_sleep:
+                ray.get(self.critic_model_group.async_run_method(method_name="offload_states"))
+
+        # actor model training
         if global_steps > self.freezing_actor_steps:
-            status = self.training_step_actor(experience, length_status=length_status)
-        if self.critic is not None:
-            status.update(self.training_step_critic(experience, length_status=length_status))
+            if self.strategy.args.deepspeed_enable_sleep:
+                self.actor_model_group.async_run_method(method_name="reload_states")
+
+            actor_status_ref = self.actor_model_group.async_run_method(method_name="fit", kl_ctl=self.kl_ctl.value, global_response_length=global_response_length)
+            status.update(ray.get(actor_status_ref)[0])
+
+            if self.strategy.args.deepspeed_enable_sleep:
+                self.actor_model_group.async_run_method(method_name="offload_states")
+
+            # 4. broadcast weights to vllm engines
+            if self.vllm_engines is not None:
+                self._broadcast_to_vllm()
+
+        # 5. wait remote critic model training done
+        if self.critic_model_group and not self.strategy.args.colocate_all_models:
+            status.update(ray.get(critic_status_ref)[0])
+
         return status
 
-    def training_step_actor(self, experience: Experience, length_status=None) -> Dict[str, float]:
-        self.actor.train()
+    def _broadcast_to_vllm(self):
+        if self.strategy.args.vllm_enable_sleep:
+            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
 
-        # TODO: this is a bad indicator to say that data is packed...
-        if isinstance(experience.sequences, list):
-            sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
-            old_action_log_probs = torch.cat(experience.action_log_probs, dim=0).unsqueeze(0)
-            advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
-            num_actions = [v.numel() for v in experience.advantages]
-            packed_seq_lens = [s.numel() for s in experience.sequences]
-            attention_mask = torch.cat(
-                [torch.full_like(s, i + 1) for i, s in enumerate(experience.sequences)], dim=0
-            ).unsqueeze(0)
-            # pad seq makes the sequence a multiple of ring_attention_size.
-            if self.strategy.ring_attn_group is not None:
-                pad_len, sequences, attention_mask, num_actions, packed_seq_lens = pad_sequences(
-                    sequences, 
-                    attention_mask, 
-                    num_actions, 
-                    packed_seq_lens, 
-                    self.strategy.ring_attn_group
-                )
-            if self.args.use_kl_loss and experience.base_action_log_probs is not None:
-                base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
-        else:
-            sequences = experience.sequences
-            old_action_log_probs = experience.action_log_probs
-            advantages = experience.advantages
-            num_actions = experience.action_mask.size(1)
-            packed_seq_lens = None
-            attention_mask = experience.attention_mask
-            if self.args.use_kl_loss and experience.base_action_log_probs is not None:
-                base_action_log_probs = experience.base_action_log_probs
-            if self.strategy.args.sft_loss_coef > 0:
-                acc_ratio = experience.info['acc_ratio']
-            else:
-                acc_ratio = None
+            batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-        # actor loss
-        action_log_probs, output = self.actor(
-            sequences,
-            num_actions,
-            attention_mask=attention_mask,
-            return_output=True,
-            ring_attn_group=self.strategy.ring_attn_group,
-            logps_allgather=True,
-            packed_seq_lens=packed_seq_lens
-        )
-        # unpad sequence ensures that pad tokens do not contribute to the loss calculation.
-        if self.strategy.ring_attn_group is not None:
-            assert pad_len is not None
-            sequences, attention_mask, num_actions, packed_seq_lens, action_log_probs, _, _ = unpad_sequences(
-                pad_len=pad_len,
-                sequences=sequences, 
-                attention_mask=attention_mask, 
-                num_actions=num_actions, 
-                packed_seq_lens=packed_seq_lens, 
-                action_log_probs=action_log_probs,
-                ring_attn_group=self.strategy.ring_attn_group
-            )
+        ray.get(self.actor_model_group.async_run_method(method_name="broadcast_to_vllm"))
 
-        # loss function
-        # actor_loss = self.actor_loss_fn(
-        #     action_log_probs,
-        #     old_action_log_probs,
-        #     advantages,
-        #     action_mask=experience.action_mask,
-        # )
-
-        # add control_variate and control_variate_f_div
-        if self.args.advantage_estimator in ['control_variate', 'control_variate_f_div']:
-            actor_loss = self.dpg_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                action_mask=experience.action_mask,
-                env_mask=experience.env_mask,
-                length_status=length_status
-            )
-        else:
-            actor_loss = self.actor_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                action_mask=experience.action_mask,
-                env_mask=experience.env_mask,
-                length_status=length_status
-            )
-
-        entropy_loss = self.entropy_loss_fn(
-                    output['logits'],
-                    num_actions,
-                    action_mask=experience.action_mask,
-                    env_mask=experience.env_mask,
-                    length_status=length_status)
-
-        if self.args.entropy_loss_coef > 0:
-            actor_loss -= entropy_loss * self.args.entropy_loss_coef
-
-        if self.strategy.args.sft_loss_coef > 0 and acc_ratio is not None:
-            # action_log_probs [batch_size, seq_len]
-            acc_ratio = acc_ratio.unsqueeze(1).to(action_log_probs.device) # [batch_size, 1]
-            if length_status is not None:
-                if experience.env_mask is not None:
-                    sft_loss = -(action_log_probs * experience.env_mask * experience.action_mask * acc_ratio).sum(axis=-1).sum()
-                else:
-                    sft_loss = -(action_log_probs * experience.action_mask * acc_ratio).sum(axis=-1).sum()
-                sft_loss /= (1e-10+length_status['sft_response_length'])
-            else:
-                if experience.env_mask is not None:
-                    sft_loss = -(action_log_probs * experience.env_mask * experience.action_mask * acc_ratio).sum(axis=-1)
-                else:
-                    sft_loss = -(action_log_probs * experience.action_mask * acc_ratio).sum(axis=-1)
-                sft_loss /= (1e-10+experience.action_mask * acc_ratio).sum(axis=-1)
-                sft_loss = sft_loss.mean()
-            actor_loss += self.strategy.args.sft_loss_coef * sft_loss
-        else:
-            sft_loss = None
-
-        if self.args.use_kl_loss:
-            if self.initial_model is not None:
-                kl = compute_approx_kl(
-                    action_log_probs,
-                    base_action_log_probs,
-                    experience.action_mask,
-                    kl_estimator = self.args.kl_estimator,
-                    env_mask=experience.env_mask
-                )
-            else:
-                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device = action_log_probs.device)
-
-            if not self.args.packing_samples:
-                kl_mean = masked_mean(kl, experience.action_mask, experience.env_mask, dim=-1)
-            else:
-                # convert tensor into list of tensors so that it's easier to manipulate
-                # within dataset.
-
-                kl = unpacking_samples(kl, num_actions)
-                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device = action_log_probs.device)
-
-            kl_loss = kl_mean.mean()
-            experience.info["kl"] = kl_loss.item()
-        else:
-            kl_loss = 0
-
-        # mixtral
-        if self.aux_loss:
-            aux_loss = output.aux_loss
-        else:
-            aux_loss = 0
-        loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
-        self.strategy.backward(loss, self.actor, self.actor_optim)
-
-        # ptx loss
-        if self.pretrain_dataloader is not None:
-            data = next(self.pretrain_dataloader)
-            inputs = data[1].squeeze(1).to(torch.cuda.current_device())
-            attention_mask = data[2].squeeze(1).to(torch.cuda.current_device())
-            label = torch.where(
-                attention_mask.bool(),
-                inputs,
-                self.ptx_loss_fn.IGNORE_INDEX,
-            )
-
-            output = self.actor(inputs, attention_mask=attention_mask, return_output=True)
-            ptx_log_probs = output["logits"]
-
-            # loss function
-            ptx_loss = self.ptx_loss_fn(ptx_log_probs, label)
-            # mixtral
-            if self.aux_loss:
-                aux_loss = output.aux_loss
-            else:
-                aux_loss = 0
-            loss = ptx_loss + aux_loss * self.args.aux_loss_coef
-            self.strategy.backward(self.ptx_coef * loss, self.actor, self.actor_optim)
-
-        self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
-        if self.ema_model:
-            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
-
-        # status
-        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
-        
-        # add entropy_loss
-        if entropy_loss is not None:
-            status['entropy_loss'] = entropy_loss.item()
-        if sft_loss is not None:
-            status['sft_loss'] = sft_loss.item()
-        if acc_ratio is not None:
-            status['acc_ratio'] = acc_ratio.item()
-
-        if self.pretrain_dataloader is not None:
-            status["ptx_loss"] = ptx_loss.item()
-        for k, v in experience.info.items():
-            if k == "kl":
-                status[k] = (
-                    (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
-                ).item()
-            else:
-                v = v.to(torch.float32)
-                status[k] = v.mean().item()
-
-        # ppo_clip
-        ratio = (action_log_probs - old_action_log_probs).exp()
-        ratio_clipped = ratio.clamp(1 - self.args.eps_clip, 1 + self.args.eps_clip_high)
-        clipped_ratio = masked_mean((ratio != ratio_clipped).float(), experience.action_mask, experience.env_mask, dim=-1)
-        status['clipped_ratio'] = (
-                    (clipped_ratio * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
-                ).item()
-        return status
-
-    def training_step_critic(self, experience: Experience, length_status=None) -> Dict[str, float]:
-        self.critic.train()
-
-        # TODO: this is a bad indicator to say that data is packed...
-        if isinstance(experience.sequences, list):
-            sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
-            old_values = torch.cat(experience.values, dim=0).unsqueeze(0)
-            returns = torch.cat(experience.returns, dim=0).unsqueeze(0)
-            num_actions = [v.numel() for v in experience.advantages]
-            packed_seq_lens = [s.numel() for s in experience.sequences]
-            attention_mask = torch.cat(
-                [torch.full_like(s, i + 1) for i, s in enumerate(experience.sequences)], dim=0
-            ).unsqueeze(0)
-            # pad seq makes the sequence len a multiple of ring_attention_size.
-            if self.strategy.ring_attn_group is not None:
-                pad_len, sequences, attention_mask, num_actions, packed_seq_lens = pad_sequences(
-                    sequences, 
-                    attention_mask, 
-                    num_actions, 
-                    packed_seq_lens, 
-                    self.strategy.ring_attn_group
-                )
-
-        else:
-            sequences = experience.sequences
-            old_values = experience.values
-            returns = experience.returns
-            num_actions = experience.action_mask.size(1)
-            packed_seq_lens = None
-            attention_mask = experience.attention_mask
-
-        # critic loss
-        values, output = self.critic(
-            sequences,
-            num_actions=num_actions,
-            attention_mask=attention_mask,
-            return_output=True,
-            ring_attn_group=self.strategy.ring_attn_group,
-            values_allgather=True,
-            packed_seq_lens=packed_seq_lens,
-        )
-        # unpad sequence ensures that pad tokens do not contribute to the loss calculation
-        if self.strategy.ring_attn_group is not None:
-            assert pad_len is not None
-            sequences, attention_mask, num_actions, packed_seq_lens, _, values, _ = unpad_sequences(
-                pad_len=pad_len,
-                sequences=sequences, 
-                attention_mask=attention_mask, 
-                num_actions=num_actions, 
-                packed_seq_lens=packed_seq_lens, 
-                values=values,
-                ring_attn_group=self.strategy.ring_attn_group
-            )
-
-        # loss function
-        critic_loss = self.critic_loss_fn(
-            values,
-            old_values,
-            returns,
-            action_mask=experience.action_mask,
-            env_mask=experience.env_mask,
-            length_status=length_status
-        )
-        # mixtral
-        if self.aux_loss:
-            aux_loss = output.aux_loss
-        else:
-            aux_loss = 0
-        loss = critic_loss + aux_loss * self.args.aux_loss_coef
-        self.strategy.backward(loss, self.critic, self.critic_optim)
-        self.strategy.optimizer_step(self.critic_optim, self.critic, self.critic_scheduler, name="critic")
-
-        # status
-        status = {
-            "critic_loss": critic_loss.item(),
-            "values": masked_mean(values, experience.action_mask, experience.env_mask).item(),
-            "critic_lr": self.critic_scheduler.get_last_lr()[0],
-        }
-        return status
+        if self.strategy.args.vllm_enable_sleep:
+            batch_vllm_engine_call(self.vllm_engines, "sleep")
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
             # wandb
-            if self._wandb is not None and self.strategy.is_rank_0():
+            if self._wandb is not None:
+                # Add generated samples to wandb using Table
+                if "generated_samples" in logs_dict:
+                    # https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
+                    new_table = self._wandb.Table(
+                        columns=self.generated_samples_table.columns, data=self.generated_samples_table.data
+                    )
+                    new_table.add_data(global_step, *logs_dict.pop("generated_samples"))
+                    self.generated_samples_table = new_table
+                    self._wandb.log({"train/generated_samples": new_table})
                 logs = {
                     "train/%s" % k: v
                     for k, v in {
@@ -887,42 +206,445 @@ class PPOTrainer(ABC):
                         "global_step": global_step,
                     }.items()
                 }
-                if self.experience_maker.perf_stats is not None:
-                    logs.update({f"perf/experience_maker/{k}": v for k, v in self.experience_maker.perf_stats.items()})
                 self._wandb.log(logs)
             # TensorBoard
-            elif self._tensorboard is not None and self.strategy.is_rank_0():
+            elif self._tensorboard is not None:
                 for k, v in logs_dict.items():
-                    self._tensorboard.add_scalar(f"train/{k}", v, global_step)
-                if self.experience_maker.perf_stats is not None:
-                    for k, v in self.experience_maker.perf_stats.items():
-                        self._tensorboard.add_scalar(f"perf/experience_maker/{k}", v, global_step)
+                    if k == "generated_samples":
+                        # Record generated samples in TensorBoard using simple text format
+                        text, reward = v
+                        formatted_text = f"Sample:\n{text}\n\nReward: {reward:.4f}"
+                        self._tensorboard.add_text("train/generated_samples", formatted_text, global_step)
+                    else:
+                        self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
         # TODO: Add evaluation mechanism for PPO
-        if global_step % args.eval_steps == 0:
-            # self.evaluate(self.eval_dataloader, global_step)
-            pass
+        if global_step % args.eval_steps == 0 and self.eval_dataloader and len(self.eval_dataloader) > 0:
+            self.evaluate(self.eval_dataloader, global_step, args.eval_temperature, args.eval_n_samples_per_prompt)
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            self._save_checkpoint(args, tag, client_states)
-
-    def _save_checkpoint(self, args, tag, client_states):
-        if not self.disable_ds_ckpt:
-            self.strategy.save_ckpt(
-                self.actor.model,
-                os.path.join(args.ckpt_path, "_actor"),
-                tag,
-                args.max_ckpt_num,
-                args.max_ckpt_mem,
-                client_states,
+            ref = self.actor_model_group.async_run_method(
+                method_name="save_checkpoint", tag=tag, client_states=client_states
             )
-            if self.critic is not None:
-                self.strategy.save_ckpt(
-                    self.critic, os.path.join(args.ckpt_path, "_critic"), tag, args.max_ckpt_num, args.max_ckpt_mem
+            if self.critic_model_group is not None:
+                ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
+            ray.get(ref)
+
+    def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
+        """Evaluate model performance on eval dataset.
+
+        Args:
+            eval_dataloader: DataLoader containing evaluation prompts, labels and data sources
+            global_step: Current training step for logging
+            n_samples_per_prompt: Number of samples to generate per prompt for pass@k calculation
+        """
+        start_time = time.time()
+        logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # vLLM wakeup when vllm_enable_sleep
+        if self.strategy.args.vllm_enable_sleep:
+            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+
+        with torch.no_grad():
+            # First collect all prompts and labels
+            all_prompts = []
+            all_labels = []
+            prompt_to_datasource = {}  # Dictionary to store mapping between prompts and their data sources
+
+            for datasources, prompts, labels in eval_dataloader:
+                all_prompts.extend(prompts)
+                all_labels.extend(labels)
+                # Create mapping for each prompt to its corresponding data source
+                for prompt, datasource in zip(prompts, datasources):
+                    prompt_to_datasource[prompt] = datasource
+
+            # Generate samples and calculate rewards
+            generate_kwargs = self.generate_kwargs.copy()
+            generate_kwargs["temperature"] = temperature
+            generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
+            samples_list = self.samples_generator.generate_samples(
+                all_prompts, all_labels, **generate_kwargs
+            )
+
+            # duplicate prompts and labels for each sample
+            all_prompts = sum([s.prompts for s in samples_list], [])
+            all_labels = sum([s.labels for s in samples_list], [])
+
+            # Get rewards from samples, such as agent rewards or remote reward models
+            rewards_list = []
+            for samples in samples_list:
+                rewards_list.append(samples.rewards)
+            # Reshape rewards to (num_prompts, n_samples_per_prompt)
+            rewards = torch.tensor(rewards_list).reshape(-1, n_samples_per_prompt)
+
+            # Collect local statistics for each data source
+            global_metrics = {}  # {datasource: {"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}}
+
+            # Process rewards in chunks of n_samples_per_prompt
+            num_prompts = len(all_prompts) // n_samples_per_prompt
+            for i in range(num_prompts):
+                # Get the original prompt (first one in the chunk)
+                original_prompt = all_prompts[i * n_samples_per_prompt]
+                datasource = prompt_to_datasource[original_prompt]  # Get corresponding data source using the mapping
+
+                if datasource not in global_metrics:
+                    global_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+
+                # Get rewards for this chunk
+                chunk_rewards = rewards[i]
+
+                # Calculate pass@k and pass@1
+                if n_samples_per_prompt > 1:
+                    global_metrics[datasource][f"pass{n_samples_per_prompt}"] += chunk_rewards.max().float().item()
+                global_metrics[datasource]["pass1"] += chunk_rewards.mean().float().item()
+                global_metrics[datasource]["count"] += 1
+
+            # Calculate global averages
+            logs = {}
+            for datasource, metrics in global_metrics.items():
+                logs[f"eval_{datasource}_pass{n_samples_per_prompt}"] = (
+                    metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
+                )
+                logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
+
+            # Log to wandb/tensorboard
+            if self._wandb is not None:
+                logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_step}.items()}
+                self._wandb.log(logs)
+            elif self._tensorboard is not None:
+                for k, v in logs.items():
+                    self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
+
+        if self.strategy.args.vllm_enable_sleep:
+            batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+        end_time = time.time()
+        duration = end_time - start_time
+        time_str = str(timedelta(seconds=duration)).split(".")[0]
+        logger.info(f"✨ Evaluation completed in {time_str}, global_step {global_step}, eval_metrics: {logs}")
+
+    def prepare_datasets(self):
+        args = self.args
+        strategy = self.strategy
+
+        # prepare datasets
+        train_data = blending_datasets(
+            args.prompt_data,
+            args.prompt_data_probs,
+            strategy,
+            args.seed,
+            max_count=args.max_samples,
+            dataset_split=self.prompt_split,
+        )
+
+        # Create train dataset
+        train_data = train_data.select(range(min(args.max_samples, len(train_data))))
+        prompts_dataset = PromptDataset(train_data, self.tokenizer, strategy, input_template=args.input_template)
+        prompts_dataloader = strategy.setup_dataloader(
+            prompts_dataset,
+            args.vllm_generate_batch_size,
+            True,
+            True,
+        )
+
+        # Create eval dataset if eval data exists
+        if getattr(args, "eval_dataset", None):
+            eval_data = blending_datasets(
+                args.eval_dataset,
+                None,  # No probability sampling for eval datasets
+                strategy,
+                dataset_split=self.eval_split,
+            )
+            eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
+            eval_dataset = PromptDataset(eval_data, self.tokenizer, strategy, input_template=args.input_template)
+            eval_dataloader = strategy.setup_dataloader(eval_dataset, 1, True, False)
+        else:
+            eval_dataloader = None
+
+        self.prompts_dataloader = prompts_dataloader
+        self.eval_dataloader = eval_dataloader
+        self.max_steps = (
+            len(prompts_dataset)
+            * args.n_samples_per_prompt
+            // args.train_batch_size
+            * args.num_episodes
+            * args.max_epochs
+        )
+
+    def get_max_steps(self):
+        return self.max_steps
+
+
+@ray.remote
+class PPOTrainer(BasePPOTrainer):
+    """
+    Trainer for Proximal Policy Optimization (PPO) / REINFORCE++ / GRPO / RLOO and their variants.
+    Single Controller with Multiple ActorGroups
+    """
+
+    def __init__(
+        self,
+        pretrain: str,
+        strategy: DeepspeedStrategy,
+        actor_model_group: PPORayActorGroup,
+        critic_model_group: PPORayActorGroup,
+        reward_model_group: PPORayActorGroup,
+        reference_model_group: PPORayActorGroup,
+        vllm_engines=None,
+        prompt_max_len: int = 120,
+        dataloader_pin_memory: bool = True,
+        prompt_split: str = "train",
+        eval_split: str = "test",
+        **generate_kwargs,
+    ) -> None:
+        super().__init__(
+            pretrain,
+            strategy,
+            actor_model_group,
+            critic_model_group,
+            reward_model_group,
+            reference_model_group,
+            vllm_engines,
+            prompt_max_len,
+            dataloader_pin_memory,
+            prompt_split,
+            eval_split,
+            **generate_kwargs,
+        )
+
+        if self.kl_target:
+            self.kl_ctl = AdaptiveKLController(self.init_kl_coef, self.kl_target, self.kl_horizon)
+        else:
+            self.kl_ctl = FixedKLController(self.init_kl_coef)
+
+        # if self.args.remote_rm_url and not self.args.remote_rm_url[0] == "agent":
+        #     from openrlhf.utils.remote_rm_utils import RemoteRewardModel
+
+        #     self.remote_reward_model = RemoteRewardModel.remote(self.args, self.remote_rm_url)
+        self.remote_reward_model = None
+
+        self.samples_generator = self.generator_cls(
+            self.vllm_engines,
+            self.strategy,
+            self.tokenizer,
+            self.prompt_max_len,
+        )
+
+        self.experience_maker = RemoteExperienceMaker(
+            self.actor_model_group,
+            self.critic_model_group,
+            self.reward_model_group,
+            self.reference_model_group,
+            self.kl_ctl,
+            self.strategy,
+            self.tokenizer,
+            remote_reward_model=None,
+        )
+
+        self.prepare_datasets()
+        self._init_wandb()
+
+        self.experiences = []
+
+        # get eval and save steps
+        if self.args.eval_steps == -1:
+            self.args.eval_steps = float("inf")  # do not evaluate
+        if self.args.save_steps == -1:
+            self.args.save_steps = float("inf")  # do not save ckpt
+
+    def fit(
+        self,
+    ) -> None:
+        args = self.args
+
+        # broadcast init checkpoint to vllm
+        ckpt_path = os.path.join(args.ckpt_path, "_actor")
+        if args.load_checkpoint and os.path.exists(ckpt_path):
+            checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
+                0
+            ]
+            logger.info(f"checkpoint_states: {checkpoint_states}")
+            self._broadcast_to_vllm()
+        else:
+            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
+
+        # Restore step and start_epoch
+        steps = checkpoint_states["global_step"] + 1
+        episode = checkpoint_states["episode"]
+        data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
+        if data_loader_state_dict:
+            self.prompts_dataloader.load_state_dict(data_loader_state_dict)
+            logger.info({
+                'INFO': '##LOAD-DATA-LOADER-STATE-DICT##',
+                'VALUE': data_loader_state_dict
+            })
+            start_idx = data_loader_state_dict['_num_yielded']
+        else:
+            start_idx = 0
+
+        for episode in range(episode, args.num_episodes):
+            pbar = tqdm(
+                range(self.prompts_dataloader.__len__()),
+                desc=f"Episode [{episode + 1}/{args.num_episodes}]",
+                disable=False,
+            )
+
+            filtered_samples = []
+            number_of_samples = 0
+            for data_idx, (_, rand_prompts, labels) in enumerate(self.prompts_dataloader):
+                rollout_samples = self.samples_generator.generate_samples(
+                    rand_prompts, labels, **self.generate_kwargs
                 )
 
-        if self.save_hf_ckpt:
-            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
-            self.strategy.save_model(self.actor, self.tokenizer, save_path)
+                # Dump rollout samples
+                dump_idx = episode * self.prompts_dataloader.__len__() + data_idx
+                dump_samples(self.args, dump_idx, rollout_samples, prefix='rollout_sample_eposide')
+
+                pbar.update()
+
+                # dynamic filtering
+                pass_rate = None
+                if self.args.dynamic_filtering:
+                    number_of_samples += len(rollout_samples)
+                    # Group individual samples into batches of n_samples size
+                    for i in range(0, len(rollout_samples), self.args.n_samples_per_prompt):
+                        batch_samples = rollout_samples[i : i + self.args.n_samples_per_prompt]
+                        if len(batch_samples) < self.args.n_samples_per_prompt:
+                            continue
+
+                        # Calculate average reward for this batch of samples
+                        avg_reward = sum([sample.rewards[0]['answer_rewards'][0] for sample in batch_samples]) / len(batch_samples)
+
+                        # Check if average reward is within the specified range
+                        min_reward, max_reward = self.args.dynamic_filtering_reward_range
+                        if min_reward + 1e-6 < avg_reward < max_reward - 1e-6:
+                            filtered_samples.extend(batch_samples)
+
+                    # Continue sampling if filtered samples are insufficient
+                    if len(filtered_samples) / self.args.n_samples_per_prompt < self.args.rollout_batch_size:
+                        logger.info(
+                            f"filtered_samples {len(filtered_samples) / self.args.n_samples_per_prompt} < rollout_batch_size {self.args.rollout_batch_size}, continue sampling"
+                        )
+                        continue
+
+                    pass_rate = len(filtered_samples) / number_of_samples * 100
+                    logger.info(
+                        f"Dynamic filtering pass rate: {pass_rate:.2f}% ({len(filtered_samples)}/{number_of_samples})"
+                    )
+                    rollout_samples = filtered_samples[: self.args.rollout_batch_size * self.args.n_samples_per_prompt]
+                    filtered_samples = []
+                    number_of_samples = 0
+
+                # Dump make-exp samples
+                dump_samples(self.args, dump_idx, rollout_samples, prefix='make_exp_eposide')
+
+                experiences = self.experience_maker.make_experience_batch(rollout_samples)
+                
+                # # filter-experiences
+                if self.args.use_replay_buffer_filter:
+                    experience_num = self.args.rollout_batch_size * self.args.n_samples_per_prompt
+                    for experience_batch in experiences:
+                        experience_list = split_experience_batch(experience_batch)
+                        for experience in experience_list:
+                            if experience.info['answer_rewards'].item() > 0.1:
+                                # positive-samples needs to be carefully evaluated, this will be reinforce-much progressively
+                                if experience.info['repeatness'].item() > 0.05:
+                                    continue
+                            self.experiences.append(experience)
+
+                    logger.info(
+                                f"filtered_experiences {len(self.experiences) / experience_num} < rollout_batch_size {experience_num}, continue sampling"
+                            )
+
+                    if len(self.experiences) < experience_num:
+                        continue
+                    
+                    # random.shuffle(self.experiences)
+                    # # make sure good/bad experiences are balanced
+                    # experiences, remaining_experiences = experience_statistics(self.experiences, experience_num)
+                    # if not experiences:
+                    #     self.experiences = []
+                    #     logger.info(
+                    #         f"reset_experiences {len(self.experiences)} due to no good experiences"
+                    #     )
+                    #     continue
+
+                    # self.experiences = remaining_experiences
+                    experiences = self.experiences[:experience_num]
+                    self.experiences = self.experiences[experience_num:]
+
+                    logger.info(
+                        f"left_experiences {len(self.experiences)}"
+                    )
+
+                experiences = self.experience_maker.normalize_experience(experiences)
+                random.shuffle(experiences)
+                sample0 = self.tokenizer.batch_decode(
+                    experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
+                )
+                print(sample0)
+                if self.args.use_seq_balancing:
+                    seqlen = [exp.attention_mask.sum().tolist() for exp in experiences]
+                    num_actors = len(self.actor_model_group._actor_handlers)
+                    k_partitions = num_actors // self.actor_model_group.duplicate_actors
+                    actor_experience_ids = get_seqlen_balanced_partitions(seqlen, k_partitions, equal_size=True)
+                    actor_experiences = []
+                    for group_ids in actor_experience_ids:
+                        for idx in group_ids:
+                            actor_experiences.append(experiences[idx])
+                else:
+                    actor_experiences = experiences
+                refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=actor_experiences)
+                if self.critic_model_group is not None:
+                    if self.args.use_seq_balancing:
+                        seqlen = [exp.attention_mask.sum().tolist() for exp in experiences]
+                        num_actors = len(self.critic_model_group._actor_handlers)
+                        k_partitions = num_actors // self.critic_model_group.duplicate_actors
+                        critic_experience_ids = get_seqlen_balanced_partitions(seqlen, k_partitions, equal_size=True)
+                        critic_experiences = []
+                        for group_ids in critic_experience_ids:
+                            for idx in group_ids:
+                                critic_experiences.append(experiences[idx])
+                    else:
+                        critic_experiences = experiences
+                    refs.extend(
+                        self.critic_model_group.async_run_method_batch(method_name="append", experience=critic_experiences)
+                    )
+                ray.get(refs)
+
+                if self.args.use_global_token_level_loss:
+                    global_response_length = sum([exp.action_mask.sum().tolist() for exp in experiences])
+                else:
+                    global_response_length = None
+                status = self.ppo_train(steps, global_response_length=global_response_length)
+
+                if "kl" in status:
+                    self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
+
+                if global_response_length is not None:
+                    status['global_response_length'] = global_response_length
+                
+                # Add generated samples to status dictionary
+                if self.args.dynamic_filtering:
+                    status["dynamic_filtering_pass_rate"] = pass_rate
+                logger.info(f"✨ Global step {steps}: {status}")
+                status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+
+                # logs/checkpoints
+                client_states = {
+                    "global_step": steps,
+                    "episode": episode,
+                    "data_loader_state_dict": self.prompts_dataloader.state_dict(),
+                }
+                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+
+                steps = steps + 1
+
+        if self._wandb is not None:
+            self._wandb.finish()
+        if self._tensorboard is not None:
+            self._tensorboard.close()
