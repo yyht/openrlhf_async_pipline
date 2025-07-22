@@ -145,12 +145,22 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
         if left_max_tokens > 0:
             new_request.max_tokens = left_max_tokens
         else:
+            finish_reason = 'length'
+            logger.info({
+                'INFO': '##LENGTH-STOP##',
+                'OUTPUT_VALUE': len(output_token_ids),
+            })
             break
 
         new_request.prompts = [new_prompt+output_text]
         new_request.prompt_token_ids = prompt_token_ids + output_token_ids
         if len(new_request.prompt_token_ids) >= new_request.max_length:
             finish_reason = 'length'
+            logger.info({
+                'INFO': '##LENGTH-STOP##',
+                'PROMPT_VALUE': len(prompt_token_ids),
+                'OUTPUT_VALUE': len(output_token_ids),
+            })
             break
         
         idx, output = await process_single_request(url, headers, idx, new_request, **kwargs)
@@ -300,9 +310,14 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
             # output_text += text
             next_turn_output_text = text
 
-        if len(output_token_ids)+len(token_ids) > max_tokens:
-            finish_reason = 'length'
-            break
+        # if len(output_token_ids)+len(token_ids) > max_tokens:
+        #     finish_reason = 'length'
+        #     logger.info({
+        #         'INFO': '##LENGTH-STOP##',
+        #         'OUTPUT_VALUE': len(output_token_ids),
+        #         'NEXT_OUTPUT_VALUE': len(token_ids)
+        #     })
+        #     break
 
         output_token_ids.extend(token_ids)
         action_masks.extend(action_mask)
