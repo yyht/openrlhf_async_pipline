@@ -594,11 +594,14 @@ class TrainingActor(BasePPOTrainer):
             sample0 = self.tokenizer.batch_decode(experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True)
             print(sample0)
             if self.args.use_dynamic_bs_ds or self.args.use_dynamic_batch:
+                micro_train_batch_size = self.args.micro_train_batch_size
+                if self.args.use_dynamic_batch:
+                    micro_train_batch_size = 1
                 num_actors = len(self.actor_model_group._actor_handlers)
                 effective_actors = num_actors // self.actor_model_group.duplicate_actors
-                chunk_size = len(experiences) // (effective_actors * self.args.micro_train_batch_size)
+                chunk_size = len(experiences) // (effective_actors * micro_train_batch_size)
 
-                sample_size = chunk_size * effective_actors * self.args.micro_train_batch_size
+                sample_size = chunk_size * effective_actors * micro_train_batch_size
                 sample_chunk_size = sample_size // self.args.n_samples_per_prompt
                 actual_sample_size = sample_chunk_size * self.args.n_samples_per_prompt
                 actor_experiences = experiences[:actual_sample_size]
@@ -629,11 +632,14 @@ class TrainingActor(BasePPOTrainer):
             refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences_actor)
             if self.critic_model_group is not None:
                 if self.args.use_dynamic_bs_ds or self.args.use_dynamic_batch:
+                    micro_train_batch_size = self.args.micro_train_batch_size
+                    if self.args.use_dynamic_batch:
+                        micro_train_batch_size = 1
                     num_actors = len(self.critic_model_group._actor_handlers)
                     effective_actors = num_actors // self.critic_model_group.duplicate_actors
-                    chunk_size = len(experiences) // (effective_actors * self.args.micro_train_batch_size)
+                    chunk_size = len(experiences) // (effective_actors * micro_train_batch_size)
 
-                    sample_size = chunk_size * effective_actors * self.args.micro_train_batch_size
+                    sample_size = chunk_size * effective_actors * micro_train_batch_size
                     sample_chunk_size = sample_size // self.args.n_samples_per_prompt
                     actual_sample_size = sample_chunk_size * self.args.n_samples_per_prompt
                     critic_experiences = experiences[:actual_sample_size]
