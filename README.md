@@ -44,7 +44,7 @@ The evaluation script is located at ./evaluation. You should be careful to set y
 
 ## Features
 
-- ASYNC-PIPLINE [PPO](./examples/scripts/train_long_cot_ray_7b_reinforce_baseline_tune_zero_v1_onpolicy_env_mask_async_async.sh). We have test async-rollout with pipline to incentivize the reasoning ability on math-tasks with multiturn TIR(tool-intergated-reasoning). It has been tested on 7b/32b for reinforce++ and grpo with env-mask to exclude the loss calculation for env-feedback. [Zhihu](https://zhuanlan.zhihu.com/p/1903425641954674326). It achieves better performance on AIME24/25 with fewer training-steps compared to zeor-rl-text-cot.
+- ASYNC-PIPLINE [PPO](./examples/scripts/train_long_cot_ray_7b_reinforce_baseline_tune_zero_v1_onpolicy_env_mask_async_async.sh). We have test async-rollout with pipline to incentivize the reasoning ability on math-tasks with multiturn TIR(tool-intergated-reasoning). It has been tested on 7b/32b for reinforce++ and grpo with env-mask to exclude the loss calculation for env-feedback. [Zhihu](https://zhuanlan.zhihu.com/p/1930588024850326742). It achieves better performance on AIME24/25 with fewer training-steps compared to zeor-rl-text-cot.
 - DETAIL:
     - Based on the OpenRLHF_v082 and add dynamic-batch-size feature from the latest version.
     - The clear and simple async-rl pipline, you can check it on ./openrlhf/trainer/ppo_trainer_async.py
