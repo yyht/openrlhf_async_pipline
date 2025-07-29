@@ -4,6 +4,7 @@ from typing import Optional, Any, List, Dict, Tuple
 from typing import List, Dict, Union, Any
 import ray
 
+from openrlhf.utils import get_tokenizer
 from .vllm_engine import BaseLLMRayActor
 from openrlhf.async_pipline.process_request import GenerateRequest, process_batch_requests
 from openrlhf.utils.logging_utils import init_logger
@@ -60,6 +61,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
         import vllm
 
         assert vllm.__version__ > "0.8.5", "Asyn VLLM version must be greater than 0.8.5"
+
+        self.model_path = self.kwargs['model']
 
         engine_args = vllm.AsyncEngineArgs(*args, **self.kwargs)
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
@@ -137,7 +140,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
             max_tokens=request.max_tokens,
             include_stop_str_in_output=request.include_stop_str_in_output,
             stop=request.stop,
-            skip_special_tokens=False
+            skip_special_tokens=False,
+            allowed_token_ids=request.allowed_token_ids if allowed_token_ids is not None else None
         )
 
         # request_id = str(uuid.uuid4())+request.uuids
@@ -145,7 +149,7 @@ class LLMRayActorAsync(BaseLLMRayActor):
         response = await self.generate_async_server(request, sampling_params, request_id)
         return response
 
-    def build_requests(self, prompts, prompt_ids, sampling_params, labels=None, requests_ranks=None, max_length=None):
+    def build_requests(self, prompts, prompt_ids, sampling_params, labels=None, requests_ranks=None, max_length=None, tokenizer=None):
         request_list = []
         for idx, (prompt, prompt_id) in enumerate(zip(prompts, prompt_ids)):
             if labels is not None:
@@ -172,6 +176,10 @@ class LLMRayActorAsync(BaseLLMRayActor):
                 request_rank = requests_ranks[idx]
             else:
                 request_rank = 0
+            if 'Qwen3' in self.model_path and tokenizer is not None:
+                allowed_token_ids = list(range(tokenizer.vocab_size)) + list(tokenizer.added_tokens_decoder.keys())
+            else:
+                allowed_token_ids = None
             request = GenerateRequest(
                 prompts=[prompt],
                 prompt_token_ids=prompt_id,
@@ -182,7 +190,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
                 env_func=env_func,
                 label=json.dumps(label_dict, ensure_ascii=False),
                 request_rank=request_rank,
-                max_length=max_length
+                max_length=max_length,
+                allowed_token_ids=allowed_token_ids
             )
             request_list.append(request)
         return request_list
@@ -236,7 +245,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
                                             sampling_params=sampling_params, 
                                             labels=labels,
                                             requests_ranks=None,
-                                            max_length=max_length)
+                                            max_length=max_length,
+                                            tokenizer=hf_tokenizer)
         if labels is not None:
             all_requests = self.group_requests(all_requests)
         batches = self._create_batches(all_requests)
