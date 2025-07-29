@@ -141,7 +141,7 @@ class LLMRayActorAsync(BaseLLMRayActor):
             include_stop_str_in_output=request.include_stop_str_in_output,
             stop=request.stop,
             skip_special_tokens=False,
-            allowed_token_ids=request.allowed_token_ids if allowed_token_ids is not None else None
+            allowed_token_ids=request.allowed_token_ids if request.allowed_token_ids is not None else None
         )
 
         # request_id = str(uuid.uuid4())+request.uuids
