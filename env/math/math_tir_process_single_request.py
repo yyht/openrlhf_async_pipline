@@ -351,7 +351,7 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
         if request.enable_vllm_is_correction:
             rollout_log_probs.extend(current_rollout_log_probs)
 
-            assert len(token_ids) == len(rollout_log_probs)
+            assert len(output_token_ids) == len(rollout_log_probs)
         
         output_text += next_turn_output_text
 
