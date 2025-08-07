@@ -95,6 +95,11 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
     request_id = ''
     env_exec_times = 0
 
+    if request.enable_vllm_is_correction:
+        rollout_log_probs = []
+    else:
+        rollout_log_probs = None
+
     prompt_token_ids = request.prompt_token_ids
     
     is_terminated = False
@@ -124,6 +129,7 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
         env_exec_times = request.env_exec_times
         logger.info("##Recontinue for env-interactive##")
         code_snippets = request.code_snippets
+        rollout_log_probs = request.rollout_log_probs
 
     code_exection_errors = []
     code_exection_nums = []
@@ -178,6 +184,7 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
                 new_request.env_exec_times = env_exec_times
                 new_request.max_tokens = max_tokens
                 new_request.code_snippets = code_snippets
+                new_request.rollout_log_probs = rollout_log_probs
                 return new_request
 
         text = output[0]['outputs'][0]['text']
@@ -185,6 +192,16 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
         action_mask = [1] * len(token_ids)
         stop_reason = output[0]['outputs'][0]['stop_reason']
         finish_reason = output[0]['outputs'][0]['finish_reason']
+
+        # Calculate rollout log probs
+        if request.enable_vllm_is_correction:
+            # action tokens logprobs
+            current_rollout_log_probs = []
+            for i, token_id in enumerate(token_ids):
+                log_prob_list = output[0]['outputs'][0]['log_probs']
+                current_rollout_log_probs.append(log_prob_list[i][token_id].logprob)
+        else:
+            current_rollout_log_probs = None
         
         if output[0]['outputs'][0]['stop_reason'] in ['```python']:
             iterative_num += 1
@@ -247,13 +264,17 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
                         _, output_dict = await sandbox_compile(code4exec, all_request_id, try_max_times=MAX_RETRIES, multiturn_codes=multiturn_codes)
                         # each-time, we only keep the latest code4exec
                         output_dict['query'] = code4exec
-                    except:
+                    except Exception as e:
                         output_dict = {
                             'query': code4exec,
                             'uuid': all_request_id,
                             'exec_result': "TimeOut Error",
                             'error': 1
                         }
+                        logger.info({
+                            'INFO': "##UnexpectedException##",
+                            "VALUE": f"{e}",
+                        })
 
                     code_result = output_dict['exec_result']
                     if MULTITURN_CODE_MERGE == 'YES':
@@ -295,6 +316,11 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
                     token_ids.extend(code_output_ids)
                     action_mask.extend([0]*len(code_output_ids))
 
+                    # Calculate rollout log probs
+                    if request.enable_vllm_is_correction:
+                        # action tokens logprobs
+                        current_rollout_log_probs.extend([0.0] * (len(code_output_ids)))
+
                     env_exec_times += 1
                 else:
                     code_output = ''
@@ -321,8 +347,17 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
 
         output_token_ids.extend(token_ids)
         action_masks.extend(action_mask)
+
+        if request.enable_vllm_is_correction:
+            rollout_log_probs.extend(current_rollout_log_probs)
+
+            assert len(token_ids) == len(rollout_log_probs)
+        
         output_text += next_turn_output_text
-    
+
+        assert len(output_token_ids) == len(action_masks)
+
+
     label = json.loads(new_request.label)
 
     if kwargs.get('use_reward', True):
@@ -334,15 +369,23 @@ async def math_tir_generate_async(url, headers, idx, request, tokenizer, **kwarg
     else:
         reward_info = {}
 
+    if not request.enable_vllm_is_correction:
+        if tokenizer.eos_token_id not in output_token_ids:
+           output_token_ids += [tokenizer.eos_token_id]
+           action_masks += [1]
+
     output = GenerateOutput(
             outputs=[Output(
-                token_ids=output_token_ids+[tokenizer.eos_token_id] if tokenizer.eos_token_id not in output_token_ids else output_token_ids,
-                action_mask=action_masks+[1] if tokenizer.eos_token_id not in output_token_ids else action_masks,
+                # token_ids=output_token_ids+[tokenizer.eos_token_id] if tokenizer.eos_token_id not in output_token_ids else output_token_ids,
+                # action_mask=action_masks+[1] if tokenizer.eos_token_id not in output_token_ids else action_masks,
+                token_ids=output_token_ids,
+                action_mask=action_masks,
                 text=output_text,
                 stop_reason=stop_reason,
                 finish_reason=finish_reason,
                 env_exec_times=env_exec_times,
-                reward_info=reward_info
+                reward_info=reward_info,
+                log_probs=rollout_log_probs
             )],
             prompt_token_ids=prompt_token_ids,
             request_id=all_request_id,

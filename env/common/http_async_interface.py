@@ -31,6 +31,8 @@ class HttpRequest(BaseModel):
     output_key: Optional[str] = ''
     gold_ans: str = ''
     meta: Optional[dict] = {}
+    gold: str = ''
+    answer: str = ''
 
     def to_json(self):
         return {
@@ -47,7 +49,9 @@ class HttpRequest(BaseModel):
             "uuid_str": self.uuid_str,
             "output_key": self.output_key,
             "gold_ans": self.gold_ans,
-            "meta": self.meta
+            "meta": self.meta,
+            "gold": self.gold,
+            "answer": self.answer
         }
 
 
@@ -87,6 +91,7 @@ async def process_single_request(request: HttpRequest, **kwargs):
                         # 发送 POST 请求
                         response = await client.post(
                             task_url,
+                            headers=headers,
                             json=payload,
                             timeout=httpx.Timeout(request.request_timeout)
                         )

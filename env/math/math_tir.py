@@ -10,7 +10,6 @@ import logging
 import queue
 from threading import Thread
 import sys, os
-# sys.path.append(os.getenv('OPENRLHF_PATH', '/cpfs/user/chenhao/debug/OpenRLHF_0304'))
 
 import requests
 from env.math.code_exec import run_code

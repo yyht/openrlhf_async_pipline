@@ -19,10 +19,13 @@ COMPILE_SERVER_PORT = os.getenv('COMPILE_SERVER_PORT', '8080')
 DEBUG_FLAG = os.getenv('DEBUG_FLAG', '')
 NGINX_IP_FILE = os.getenv('NGINX_IP_FILE', '')
 
+REMOTE_SERVER = os.getenv('REMOTE_SERVER', None)
+
 logger.info({
     'INFO': 'NGINX_IP_FILE',
     "VALUE": NGINX_IP_FILE,
-    "COMPILE_SERVER_PORT": COMPILE_SERVER_PORT
+    "COMPILE_SERVER_PORT": COMPILE_SERVER_PORT,
+    "REMOTE_SERVER": REMOTE_SERVER
 })
 
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 8))
@@ -79,6 +82,8 @@ async def remote_compile(
         raise FileNotFoundError("Empty IP list")
 
     COMPILE_SERVER = f"{ip_list[0]}:{COMPILE_SERVER_PORT}"
+    if REMOTE_SERVER:
+        COMPILE_SERVER = REMOTE_SERVER
 
     output_dict = {
         'query': code4exec,
@@ -93,6 +98,8 @@ async def remote_compile(
     # 重试循环
     for try_idx in range(try_max_times):
         request_id = f"{time.time_ns()}-{uuid.uuid4()}"
+        if REMOTE_SERVER:
+            headers['X-Request-ID'] = request_id
 
         data = {
             'compile_timeout': 10,

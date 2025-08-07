@@ -33,7 +33,7 @@ ENV_ITER_NUM = int(os.getenv('ENV_ITER_NUM', '2'))
 VLLM_VERSION = os.getenv('VLLM_VERSION', 'vllm_083')
 USE_ID = os.getenv('USE_ID', 'NONE')
 
-sys.path.append(os.getenv('OPENRLHF_PATH', 'your_openrlhf_path'))
+sys.path.append(os.getenv('OPENRLHF_PATH', '/cpfs/user/chenhao/debug/OpenRLHF_082'))
 # from env.math.math_tir import math_tir_generate
 from env.math.math_tir_process_single_request import math_tir_generate_async
 from openrlhf.async_pipline.process_request import GenerateRequest, default_generate, process_batch_requests
@@ -56,11 +56,11 @@ class AsyncLLM(object):
             disable_log_requests=True,
             seed=args.seed)
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
-        self.semaphore = asyncio.Semaphore(32)  # 实例级共享
+        self.semaphore = asyncio.Semaphore(512)  # 实例级共享
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
         self.args = args
-        self.batch_size = 32
+        self.batch_size = 4
         
     def shutdown(self):
         self.llm.shutdown()  # 释放 GPU 内存
@@ -108,6 +108,7 @@ class AsyncLLM(object):
                         "token_ids": final_output.outputs[0].token_ids,
                         "stop_reason": final_output.outputs[0].stop_reason,
                         "finish_reason": final_output.outputs[0].finish_reason,
+                        "log_probs": final_output.outputs[0].logprobs
                     }
                 ],
                 "prompt_token_ids": final_output.prompt_token_ids,
@@ -128,7 +129,8 @@ class AsyncLLM(object):
             max_tokens=request.max_tokens,
             include_stop_str_in_output=request.include_stop_str_in_output,
             stop=request.stop,
-            skip_special_tokens=False
+            skip_special_tokens=False,
+            logprobs=None
         )
 
         # request_id = str(uuid.uuid4())+request.uuids
@@ -149,7 +151,8 @@ class AsyncLLM(object):
                 env_func=infer_type,
                 label=json.dumps({}, ensure_ascii=False),
                 request_rank=0,
-                max_length=sampling_params.max_tokens+1024
+                max_length=sampling_params.max_tokens+1024,
+                enable_vllm_is_correction=False
             )
             request_list.append(request)
         print(len(request_list), '==request_list==')
