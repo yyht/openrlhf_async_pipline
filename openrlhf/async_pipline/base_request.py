@@ -89,6 +89,7 @@ async def process_single_request_model(model, headers, idx, request, **kwargs):
                                     "token_ids": response[0].outputs[0].token_ids,
                                     "stop_reason": response[0].outputs[0].stop_reason,
                                     "finish_reason": response[0].outputs[0].finish_reason,
+                                    "log_probs": response[0].outputs[0].logprobs
                                 }
                             ],
                             "prompt_token_ids": response[0].prompt_token_ids

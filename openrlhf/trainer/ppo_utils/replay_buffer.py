@@ -39,6 +39,7 @@ class BufferItem:
     response_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
     loss_mask: Optional[torch.Tensor]
+    rollout_log_probs: Optional[torch.Tensor] = None
 
 
 def split_experience_batch(experience: Experience) -> List[BufferItem]:
@@ -54,7 +55,8 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "attention_mask",
         "action_mask",
         "response_mask",
-        "loss_mask"
+        "loss_mask",
+        "rollout_log_probs"
     )
     for key in keys:
         value = getattr(experience, key)
@@ -107,6 +109,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "attention_mask",
         "action_mask",
         "response_mask",
+        "rollout_log_probs"
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
@@ -124,7 +127,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask, resp_mask = (
+        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask, resp_mask, rollout_log_probs = (
             item.sequences,
             item.action_log_probs,
             item.base_action_log_probs,
@@ -134,6 +137,7 @@ def remove_padding_in_sequences(items):
             item.attention_mask,
             item.action_mask,
             item.response_mask,
+            item.rollout_log_probs
         )
         # make sure the right padding position is made
         right_pad = (1 - resp_mask.long()).sum()
@@ -151,6 +155,7 @@ def remove_padding_in_sequences(items):
             item.attention_mask,
             item.action_mask,
             item.response_mask,
+            item.rollout_log_probs
         ) = (
             seq[left_pad:right_pad],
             act_log_prob[:right_pad],
@@ -161,6 +166,7 @@ def remove_padding_in_sequences(items):
             att_mask[left_pad:right_pad],
             act_mask[:right_pad],
             resp_mask[:right_pad],
+            rollout_log_probs[:right_pad] if item.rollout_log_probs is not None else None
         )
     return items
 

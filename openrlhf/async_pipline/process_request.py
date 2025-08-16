@@ -57,6 +57,9 @@ class GenerateRequest(BaseModel):
     code_snippets: Optional[list[dict]] = []
     env_iter_num: Optional[int] = 0
     max_length: Optional[int] = 1024
+    allowed_token_ids: Optional[list[int]] = None
+    rollout_log_probs: Optional[list[float]] = None
+    enable_vllm_is_correction: Optional[bool] = False
     
 
     def to_json(self):
@@ -84,7 +87,10 @@ class GenerateRequest(BaseModel):
             "request_rank": self.request_rank,
             "code_snippets": self.code_snippets,
             "env_iter_num": self.env_iter_num,
-            "max_length": self.max_length
+            "max_length": self.max_length,
+            "allowed_token_ids": self.allowed_token_ids,
+            "rollout_log_probs": self.rollout_log_probs,
+            "enable_vllm_is_correction": self.enable_vllm_is_correction
         }
 
 def flatten_responses(responses):
@@ -135,15 +141,31 @@ async def default_generate(url, headers, idx, request, tokenizer, **kwargs):
     token_ids = list(output[0]['outputs'][0]['token_ids'])
     action_masks = [1] * len(token_ids)
 
+    if request.enable_vllm_is_correction:
+        # Calculate rollout log probs
+        # action tokens logprobs
+        rollout_log_probs = []
+        for i, token_id in enumerate(token_ids):
+            log_prob_list = output[0]['outputs'][0]['log_probs']
+            rollout_log_probs.append(log_prob_list[i][token_id].logprob)
+    else:
+        rollout_log_probs = None
+        if tokenizer.eos_token_id not in output_token_ids:
+           token_ids += [tokenizer.eos_token_id]
+           action_masks += [1]
+
     output = GenerateOutput(
             outputs=[Output(
-                token_ids=token_ids+[tokenizer.eos_token_id] if tokenizer.eos_token_id not in token_ids else token_ids,
-                action_mask=action_masks+[1] if tokenizer.eos_token_id not in token_ids else action_masks,
+                # token_ids=token_ids+[tokenizer.eos_token_id] if tokenizer.eos_token_id not in token_ids else token_ids,
+                # action_mask=action_masks+[1] if tokenizer.eos_token_id not in token_ids else action_masks,
+                token_ids=token_ids,
+                action_mask=action_masks,
                 text=output[0]['outputs'][0]['text'],
                 stop_reason=output[0]['outputs'][0]['stop_reason'],
                 finish_reason=output[0]['outputs'][0]['finish_reason'],
                 env_exec_times=0,
-                reward_info=reward_info
+                reward_info=reward_info,
+                log_probs=rollout_log_probs
             )],
             prompt_token_ids=list(output[0]['prompt_token_ids']),
             request_id=request.uuids,
@@ -380,7 +402,7 @@ async def _async_process_queue(url, start_idx, batch, **kwargs):
                         timeout=360000
                         )
                 except Exception as e:
-                    logger.debug(f"Task {current_idx} error: {str(e)[:50]}...")
+                    logger.info(f"Task {current_idx} error: {str(e)[:50]}...")
                     result = e
 
                 # 结果处理
@@ -393,7 +415,7 @@ async def _async_process_queue(url, start_idx, batch, **kwargs):
                             "retries": retries + 1,
                             "queue_idx": queue_idx
                         })
-                        logger.debug(f"Task {current_idx} retry ({retries+1}/{MAX_RETRIES})")
+                        logger.info(f"Task {current_idx} retry ({retries+1}/{MAX_RETRIES})")
                     else:
                         results[queue_idx] = None
                         logger.error(f"Task {current_idx} failed after {MAX_RETRIES} retries")

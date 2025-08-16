@@ -71,6 +71,7 @@ class Experience:
     request_ids: Optional[list[str]] = None
     loss_mask: Optional[torch.Tensor] = None
     index: Optional[list[int]] = None
+    rollout_log_probs: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def to_device(self, device: torch.device):
@@ -86,6 +87,7 @@ class Experience:
         self.kl = to(self.kl, device)
         self.info = {key: to(value, device) for key, value in self.info.items()}
         self.loss_mask = to(self.loss_mask, device)
+        self.rollout_log_probs = to(self.rollout_log_probs, device)
         return self
 
     def pin_memory(self):
@@ -101,6 +103,7 @@ class Experience:
         self.kl = pin_memory(self.kl)
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
         self.loss_mask = pin_memory(self.loss_mask)
+        self.rollout_log_probs = pin_memory(self.rollout_log_probs)
         return self
 
 
@@ -119,7 +122,8 @@ def split_experience_batch(experience: Experience) -> List[Experience]:
         "response_mask",
         "kl",
         "request_ids",
-        "loss_mask"
+        "loss_mask",
+        "rollout_log_probs"
     )
     for key in keys:
         value = getattr(experience, key)
@@ -185,6 +189,7 @@ class Samples:
     request_ids: list[str]
     index: Optional[list[int]]
     response: list[str]
+    rollout_log_probs: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -200,7 +205,8 @@ class Samples:
         packed_seq_lens=None,
         request_ids=None,
         index=None,
-        response=None
+        response=None,
+        rollout_log_probs=None
     ):
         self.sequences = sequences
         self.attention_mask = attention_mask
@@ -215,6 +221,7 @@ class Samples:
         self.request_ids = request_ids or []
         self.index = index or []
         self.response = response or []
+        self.rollout_log_probs = rollout_log_probs
 
     @staticmethod
     def concat_samples(samples_list: List["Samples"], pad_token_id) -> "Samples":
@@ -234,7 +241,11 @@ class Samples:
         attention_mask = zero_pad_sequences([s.attention_mask for s in samples_list], side="right", value=0)
         action_mask = zero_pad_sequences([s.action_mask for s in samples_list], side="right", value=0)
         response_mask = zero_pad_sequences([s.response_mask for s in samples_list], side="right", value=0)
-
+        if samples_list[0].rollout_log_probs is not None:
+            rollout_log_probs = zero_pad_sequences([s.rollout_log_probs for s in samples_list], side="right", value=0)
+        else:
+            rollout_log_probs = None
+        
         # Calculate response_length and total_length from masks
         response_length = response_mask.float().sum(dim=-1)
         total_length = attention_mask.float().sum(dim=-1)
@@ -260,7 +271,8 @@ class Samples:
             packed_seq_lens=None,
             request_ids=request_ids,
             index=index,
-            response=response
+            response=response,
+            rollout_log_probs=rollout_log_probs
         )
 
 def split_sample_batch(sample: Samples) -> List[Samples]:
@@ -279,6 +291,7 @@ def split_sample_batch(sample: Samples) -> List[Samples]:
         'request_ids',
         'index',
         'response',
+        'rollout_log_probs'
     ]
 
     for key in keys:
@@ -776,7 +789,8 @@ class RemoteExperienceMaker(ABC):
                 kl=kl,
                 request_ids=request_ids,
                 loss_mask=torch.ones(batch_size).float().to(sequences.device),
-                index=samples.index
+                index=samples.index,
+                rollout_log_probs=samples.rollout_log_probs if samples.rollout_log_probs is not None else None
             )
 
             experiences.append(experience)
@@ -826,6 +840,8 @@ class RemoteExperienceMaker(ABC):
             rewards = rewards.reshape(-1, args.n_samples_per_prompt)
             rewards = rewards - rewards.mean(-1, keepdim=True)
             # rewards = rewards.reshape(-1).chunk(len(experiences))
+        elif args.advantage_estimator in ["reinforce_baseline_nomean"]:
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
         elif args.advantage_estimator == "group_norm":
             rewards = rewards.reshape(-1, args.n_samples_per_prompt)
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
@@ -885,10 +901,11 @@ class RemoteExperienceMaker(ABC):
                     gamma, # args.gamma,
                     args.lambd,
                 )
-            elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "opo", "dpg", "reinforce_global"]:
+            elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "opo", "dpg", "reinforce_global", "reinforce_baseline_nomean"]:
                 if args.gamma != 1.0 and self.advantage_estimator in [
                     "rloo",
                     "reinforce_baseline",
+                    "reinforce_baseline_nomean",
                     "group_norm",
                     "dr_grpo",
                     "reinforce_global"
@@ -1022,8 +1039,9 @@ class RemoteExperienceMaker(ABC):
             delta = rewards[:, t] + gamma * nextvalues - values[:, t]
             lastgaelam = delta + gamma * lambd * lastgaelam
             if action_mask is not None:
-                lastgaelam *= action_mask[:, t]
-            advantages_reversed.append(lastgaelam)
+                advantages_reversed.append(lastgaelam*action_mask[:, t])
+            else:
+                advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         

@@ -59,8 +59,11 @@ class LLMRayActorAsync(BaseLLMRayActor):
 
         os.environ["VLLM_USE_V1"] = "1"
         import vllm
+        from packaging import version
 
-        assert vllm.__version__ > "0.8.5", "Asyn VLLM version must be greater than 0.8.5"
+        assert version.parse(vllm.__version__) > version.parse("0.8.2"), "OpenRLHF only supports vllm > 0.8.2"
+
+        # assert vllm.__version__ > "0.8.5", "Asyn VLLM version must be greater than 0.8.5"
 
         self.model_path = self.kwargs['model']
 
@@ -113,6 +116,7 @@ class LLMRayActorAsync(BaseLLMRayActor):
                 raise RuntimeError(f"Empty stream for request_id: {request_id}")
             
             assert final_output.request_id == request_id
+
             output = [{
                 'outputs':[
                     {
@@ -120,6 +124,7 @@ class LLMRayActorAsync(BaseLLMRayActor):
                         "token_ids": final_output.outputs[0].token_ids,
                         "stop_reason": final_output.outputs[0].stop_reason,
                         "finish_reason": final_output.outputs[0].finish_reason,
+                        "log_probs": final_output.outputs[0].logprobs
                     }
                 ],
                 "prompt_token_ids": final_output.prompt_token_ids,
@@ -141,7 +146,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
             include_stop_str_in_output=request.include_stop_str_in_output,
             stop=request.stop,
             skip_special_tokens=False,
-            allowed_token_ids=request.allowed_token_ids if request.allowed_token_ids is not None else None
+            allowed_token_ids=request.allowed_token_ids if request.allowed_token_ids is not None else None,
+            logprobs=1 if request.enable_vllm_is_correction else None,
         )
 
         # request_id = str(uuid.uuid4())+request.uuids
@@ -191,7 +197,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
                 label=json.dumps(label_dict, ensure_ascii=False),
                 request_rank=request_rank,
                 max_length=max_length,
-                allowed_token_ids=allowed_token_ids
+                allowed_token_ids=allowed_token_ids,
+                enable_vllm_is_correction=True if sampling_params.logprobs else False,
             )
             request_list.append(request)
         return request_list

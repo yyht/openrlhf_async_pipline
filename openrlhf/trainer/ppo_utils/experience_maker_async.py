@@ -26,6 +26,7 @@ class SamplesGeneratorAsync(SamplesGenerator):
             skip_special_tokens=kwargs.get("skip_special_tokens", False),
             include_stop_str_in_output=True,
             stop=["User:", "Human:", "Assistant:", "</answer>", self.tokenizer.eos_token],
+            logprobs=1 if args.enable_vllm_is_correction else None,
         )
         truncate_length = self.prompt_max_len + kwargs.get("max_new_tokens", 1024)
 
@@ -112,6 +113,11 @@ class SamplesGeneratorAsync(SamplesGenerator):
                 output_len = len(output_ids)
                 output_ids = output_ids + [pad_token_id] * (batch_max_output_len - output_len)
 
+                log_probs = output.outputs[0].log_probs
+                if log_probs is not None:
+                    log_probs = list(log_probs)
+                    log_probs = log_probs + [0.0] * (batch_max_output_len - output_len)
+
                 mask += [1] * output_len + [0] * (batch_max_output_len - output_len)
                 env_action_mask = list(output.outputs[0].action_mask) + [0] * (batch_max_output_len - len(output.outputs[0].action_mask))
                 trajectory_mask = [1] * output_len + [0] * (batch_max_output_len - output_len)
@@ -123,6 +129,11 @@ class SamplesGeneratorAsync(SamplesGenerator):
                 attention_mask = [mask]
                 action_mask = [env_action_mask]
                 response_mask = [trajectory_mask]
+                
+                if log_probs is not None:
+                    log_probs = [log_probs]
+                    log_probs = torch.tensor(log_probs)
+                    log_probs = log_probs.to("cpu")
                 
                 sequences = torch.tensor(sequences)
                 attention_mask = torch.tensor(attention_mask)
@@ -148,7 +159,8 @@ class SamplesGeneratorAsync(SamplesGenerator):
                     labels=batch_labels[batch_idx:batch_idx+1],
                     rewards=batch_rewards[batch_idx:batch_idx+1],
                     request_ids=batch_request_ids[batch_idx:batch_idx+1],
-                    response=batch_responses[batch_idx:batch_idx+1]
+                    response=batch_responses[batch_idx:batch_idx+1],
+                    rollout_log_probs=log_probs
                 )
                 samples_list.append(rollout_samples)
 

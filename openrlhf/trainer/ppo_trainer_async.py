@@ -64,7 +64,8 @@ def dump_experiences(args, eposide, experiences, prefix='train_eposide'):
         "response_mask",
         "kl",
         "request_ids",
-        "loss_mask"
+        "loss_mask",
+        "rollout_log_probs"
     )
 
     with open(output_path, 'w') as fwobj:

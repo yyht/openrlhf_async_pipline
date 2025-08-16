@@ -77,11 +77,12 @@ class PolicyLoss(nn.Module):
     Policy Loss for PPO
     """
 
-    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True, vllm_is_truncated_threshold: float = None) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
         self.token_level_loss = token_level_loss
+        self.vllm_is_truncated_threshold = vllm_is_truncated_threshold
 
     def forward(
         self,
@@ -95,6 +96,7 @@ class PolicyLoss(nn.Module):
         entropy_shape_alpha: Optional[float] = 0.1,
         entropy_shape_kappa: Optional[float] = 2.0,
         loss_mask: Optional[torch.Tensor] = None,
+        rollout_log_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
         ratio = (log_probs - old_log_probs)
@@ -104,6 +106,13 @@ class PolicyLoss(nn.Module):
         surr1 = ratio * advantages
         surr2 = clamp_ratio * advantages
         loss = -torch.min(surr1, surr2)
+
+        vllm_kl = None
+        if rollout_log_probs is not None:
+            vllm_is = torch.exp(old_log_probs - rollout_log_probs).clamp(max=self.vllm_is_truncated_threshold).detach()
+            loss = vllm_is * loss
+            vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
+
         if use_adv_shaping and entropy is not None:
             # action-entropy
             with torch.no_grad():
@@ -126,7 +135,8 @@ class PolicyLoss(nn.Module):
         return loss, {
             'clip_ratio': clip_ratio,
             'high_clip_ratio': high_clip_ratio,
-            'low_clip_ratio': low_clip_ratio
+            'low_clip_ratio': low_clip_ratio,
+            'vllm_kl': vllm_kl
         }
 
 class CISPolicyLoss(nn.Module):
@@ -134,11 +144,12 @@ class CISPolicyLoss(nn.Module):
     Policy Loss for PPO
     """
 
-    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True, vllm_is_truncated_threshold: float = None) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
         self.token_level_loss = token_level_loss
+        self.vllm_is_truncated_threshold = vllm_is_truncated_threshold
 
     def forward(
         self,
@@ -148,6 +159,7 @@ class CISPolicyLoss(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         global_response_length: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
+        rollout_log_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
         ratio = (log_probs - old_log_probs)
@@ -155,6 +167,13 @@ class CISPolicyLoss(nn.Module):
         ratio = torch.exp(ratio).detach()
         clamp_ratio = ratio.clamp(1 - self.clip_eps_low, 1 + self.clip_eps_high)
         loss = -clamp_ratio * advantages * log_probs
+
+        vllm_kl = None
+        if rollout_log_probs is not None:
+            vllm_is = torch.exp(old_log_probs - rollout_log_probs).clamp(max=self.vllm_is_truncated_threshold).detach()
+            loss = vllm_is * loss
+            vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
+
         if global_response_length is not None:
             loss = (loss * action_mask * loss_mask).sum(dim=None) / (1e-10+global_response_length)
         else:
@@ -167,6 +186,7 @@ class CISPolicyLoss(nn.Module):
             clip_ratio = masked_mean((ratio!=clamp_ratio).float(), action_mask, dim=None)
         return loss, {
             'clip_ratio': clip_ratio,
+            'vllm_kl': vllm_kl
         }
 
 class DualPolicyLoss(nn.Module):
@@ -174,12 +194,13 @@ class DualPolicyLoss(nn.Module):
     Policy Loss for PPO
     """
 
-    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True) -> None:
+    def __init__(self, clip_eps_low: float = 0.2, clip_eps_high: float = 0.2, token_level_loss: bool = True, vllm_is_truncated_threshold: float = None) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
         self.token_level_loss = token_level_loss
         self.clip_ratio_c = 3.0
+        self.vllm_is_truncated_threshold = vllm_is_truncated_threshold
 
     def forward(
         self,
@@ -193,6 +214,7 @@ class DualPolicyLoss(nn.Module):
         entropy_shape_alpha: Optional[float] = 0.1,
         entropy_shape_kappa: Optional[float] = 2.0,
         loss_mask: Optional[torch.Tensor] = None,
+        rollout_log_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         loss_mask = loss_mask.unsqueeze(dim=-1) # [batch_size, 1]
         ratio = (log_probs - old_log_probs)
@@ -206,6 +228,13 @@ class DualPolicyLoss(nn.Module):
         pg_losses3 = -advantages * self.clip_ratio_c
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        # Your Efficient RL Framework Secretly Brings You Off-Policy RL Training: https://fengyao.notion.site/off-policy-rl
+        vllm_kl = None
+        if rollout_log_probs is not None:
+            vllm_is = torch.exp(old_log_probs - rollout_log_probs).clamp(max=self.vllm_is_truncated_threshold).detach()
+            loss = vllm_is * loss
+            vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
 
         if use_adv_shaping and entropy is not None:
             # action-entropy
@@ -229,7 +258,8 @@ class DualPolicyLoss(nn.Module):
         return loss, {
             'clip_ratio': clip_ratio,
             'high_clip_ratio': high_clip_ratio,
-            'low_clip_ratio': low_clip_ratio
+            'low_clip_ratio': low_clip_ratio,
+            'vllm_kl': vllm_kl
         }
 
 

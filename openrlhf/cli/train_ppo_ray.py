@@ -254,6 +254,9 @@ if __name__ == "__main__":
         default=0.95,
         help="vLLM gpu_memory_utilization",
     )
+    # Your Efficient RL Framework Secretly Brings You Off-Policy RL Training: https://fengyao.notion.site/off-policy-rl
+    parser.add_argument("--enable_vllm_is_correction", action="store_true", default=False)
+    parser.add_argument("--vllm_is_truncated_threshold", type=float, default=2)
 
     # Async training using ray
     parser.add_argument("--async_train", action="store_true", default=False, help="Enable async training")
@@ -370,7 +373,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "opo", "dpg", "reinforce_global"],
+        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "opo", "dpg", "reinforce_global", "reinforce_baseline_nomean"],
         default="gae",
         help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm, dr_grpo",
     )
@@ -549,7 +552,7 @@ if __name__ == "__main__":
         else:
             args.critic_pretrain = args.pretrain
 
-    if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm"]:
+    if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm", "reinforce_baseline_nomean"]:
         assert args.n_samples_per_prompt > 1, f"{args.advantage_estimator} requires n_samples_per_prompt > 1"
 
     if args.remote_rm_url:

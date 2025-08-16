@@ -74,6 +74,9 @@ class ActorPPOTrainer(ABC):
         self.actor_loss_fn = PolicyLoss(
             clip_eps_low=self.args.eps_clip_low_high[0],
             clip_eps_high=self.args.eps_clip_low_high[1],
+            vllm_is_truncated_threshold=(
+                self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
+            ),
         )
 
         self.dpg_loss_fn = DPGLoss(
@@ -84,11 +87,17 @@ class ActorPPOTrainer(ABC):
         self.actor_cispo_loss_fn = CISPolicyLoss(
             clip_eps_low=self.args.eps_clip_low_high[0],
             clip_eps_high=self.args.eps_clip_low_high[1],
+            vllm_is_truncated_threshold=(
+                self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
+            ),
         )
 
         self.actor_dual_policy_loss_fn = DualPolicyLoss(
             clip_eps_low=self.args.eps_clip_low_high[0],
             clip_eps_high=self.args.eps_clip_low_high[1],
+            vllm_is_truncated_threshold=(
+                self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
+            ),
         )
 
         # Mixtral 8x7b
@@ -294,7 +303,8 @@ class ActorPPOTrainer(ABC):
                 advantages,
                 action_mask=experience.action_mask,
                 global_response_length=global_response_length,
-                loss_mask=loss_mask
+                loss_mask=loss_mask,
+                rollout_log_probs=experience.rollout_log_probs,
             )
         elif self.args.use_dual_policy_loss:
             actor_loss, clip_ratio_dict = self.actor_dual_policy_loss_fn(
@@ -303,7 +313,8 @@ class ActorPPOTrainer(ABC):
                 advantages,
                 action_mask=experience.action_mask,
                 global_response_length=global_response_length,
-                loss_mask=loss_mask
+                loss_mask=loss_mask,
+                rollout_log_probs=experience.rollout_log_probs,
             )
         else:
             actor_loss, clip_ratio_dict = self.actor_loss_fn(
@@ -316,11 +327,13 @@ class ActorPPOTrainer(ABC):
                 use_adv_shaping=self.args.use_adv_shaping,
                 entropy_shape_alpha=self.args.entropy_shape_alpha,
                 entropy_shape_kappa=self.args.entropy_shape_kappa,
-                loss_mask=loss_mask
+                loss_mask=loss_mask,
+                rollout_log_probs=experience.rollout_log_probs,
             )
         
         for clip_ratio_key in clip_ratio_dict:
-            experience.info[clip_ratio_key] = clip_ratio_dict[clip_ratio_key].detach()
+            if clip_ratio_dict[clip_ratio_key] is not None:
+                experience.info[clip_ratio_key] = clip_ratio_dict[clip_ratio_key].detach()
 
         if self.args.use_kl_loss:
             if self.args.init_kl_coef > 0:

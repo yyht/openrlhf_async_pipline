@@ -11,6 +11,7 @@ class Output(NamedTuple):
     finish_reason: str
     env_exec_times: int
     reward_info: Optional[dict] = {}
+    log_probs: Optional[list[float]] = None
 
 class GenerateOutput(NamedTuple):
     outputs: list[Output]
